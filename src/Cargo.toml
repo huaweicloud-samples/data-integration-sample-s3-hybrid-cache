@@ -1,0 +1,185 @@
+[package]
+name = "s3-proxy"
+version = "2.6.0"
+edition = "2021"
+# MSRV: File::unlock was stabilized in 1.89 and collides with fs2's FileExt::unlock.
+# Earlier toolchains fail with E0658 on the unlock() call sites in src/journal_consolidator.rs.
+rust-version = "1.89"
+
+[dependencies]
+# Async runtime and HTTP server
+tokio = { version = "1.0", features = ["full"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body = "1.0"
+http-body-util = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.9"
+
+# TLS support
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
+# rustls-native-certs: OS trust store loader (0.8 drops rustls-pemfile dep, resolves RUSTSEC-2025-0134)
+rustls-native-certs = "0.8"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+time = { version = "0.3", features = ["macros"] }
+webpki-roots = "0.26"
+
+# Service abstraction for connection pooling (used by CustomHttpsConnector in https_connector.rs)
+tower = "0.5"
+
+# Compression
+lz4_flex = "0.11.6"
+# xxhash32, matching the version lz4_flex itself uses internally for frame
+# checksums. Used directly by the store-mode frame writer in compression.rs
+# (see compression-content-aware-fix spec) to hand-roll a valid LZ4 frame with
+# uncompressed blocks — avoiding the LZ4 compressor entirely while still
+# producing a checksummed frame that lz4_flex::frame::FrameDecoder can read.
+twox-hash = "2.1.2"
+
+# Hashing
+blake3 = "1.5"
+
+# File locking for shared cache coordination
+fs2 = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+tracing-appender = "0.2"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Networking and DNS (hickory is the maintained successor to trust-dns)
+hickory-resolver = "0.26"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Configuration
+clap = { version = "4.0", features = ["derive"] }
+
+# Error handling
+thiserror = "1.0"
+
+# Async trait support (for dyn-compatible async traits)
+async-trait = "0.1"
+
+# RAII guard for cleanup
+scopeguard = "1.2"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+bytes = "1.0"
+futures = "0.3"
+tokio-stream = "0.1"
+gethostname = "0.4"
+hostname = "0.3"
+libc = "0.2"
+httpdate = "1.0"
+urlencoding = "2.1"
+sha2 = "0.10"
+percent-encoding = "2.3"
+regex = "1.0"
+fastrand = "2.0"
+# Inline storage for the 1-or-2-element page lists produced by page-aligned
+# range caching's overlapping-page computation (spec: page-aligned-range-cache).
+# Avoids a heap allocation for the common case (a single page).
+smallvec = "1.15.1"
+
+# Cache size tracking
+rayon = "1.8"
+walkdir = "2.4"
+
+# Concurrent data structures
+dashmap = "6.0"
+
+# OpenTelemetry for OTLP metrics export (0.29 uses rand 0.9, fully resolves RUSTSEC-2026-0097).
+# Bumped to 0.32 for GHSA-w9wp-h8wv-79jx / CVE-2026-48504 (opentelemetry_sdk baggage
+# propagation unbounded allocation, fixed in opentelemetry_sdk 0.32.1). All four
+# opentelemetry crates must move together — they share types (KeyValue, MeterProvider,
+# PushMetricExporter) across crate boundaries, and a partial bump leaves two
+# incompatible copies of `opentelemetry`/`opentelemetry_sdk` in the dependency graph
+# (fails to compile with "multiple different versions of crate X in the dependency
+# graph" — see the reverted GitHub PR #10 that only bumped opentelemetry_sdk alone).
+opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
+# default features pull in `reqwest-blocking-client`, whose blocking client cannot
+# be constructed inside the Tokio runtime and makes the HTTP exporter fail at init
+# with "no http client specified". Disable defaults and use the async reqwest-client.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = "0.32"
+
+# Platform-specific dependencies
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "handleapi", "winnt"] }
+
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio-test = "0.4"
+filetime = "0.2"
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+rcgen = "0.13"
+hex = "0.4"
+ureq = "2.9"  # For health check HTTP requests in tests
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio", "testing"] }  # testing enables InMemoryMetricExporter
+
+[[example]]
+name = "compression_demo"
+path = "examples/compression_demo.rs"
+
+[[example]]
+name = "cache_consistency_demo"
+path = "examples/cache_consistency_demo.rs"
+
+[[example]]
+name = "cache_key_sanitization_demo"
+path = "examples/cache_key_sanitization_demo.rs"
+
+[[example]]
+name = "presigned_url_demo"
+path = "examples/presigned_url_demo.rs"
+
+[[example]]
+name = "resolve_settings_bench"
+path = "examples/resolve_settings_bench.rs"
+[[example]]
+name = "ram_cache_shard_contention_bench"
+path = "examples/ram_cache_shard_contention_bench.rs"
+
+# ─── Profile tuning: reduce peak linker memory during test builds ───
+# The lib-test binary links the entire crate + heavy deps (tokio-full, hyper-full,
+# rustls, opentelemetry, rayon, hickory-resolver). With the default 16 codegen-units
+# in release, each link spikes RSS and OOM-kills the process on machines with ≤32 GB.
+# Raising codegen-units to 256 for tests produces smaller object files that link with
+# less peak RSS. opt-level=1 further shrinks intermediate artifacts vs opt-level=3.
+# This does NOT affect `cargo build --release` (the shipping binary) — only test/bench.
+
+[profile.test]
+opt-level = 1
+codegen-units = 256
+lto = false
+# Cut link-time memory for the lib-test binary (whole crate + heavy dep graph +
+# dev-deps + ~1300 inline tests statically linked). Full debuginfo=2 is the single
+# biggest contributor to the link's peak RSS and was OOM-SIGKILLing the link on
+# memory-constrained machines. line-tables-only keeps panic backtraces with
+# file:line while dropping the heavy variable/type DWARF. Pair with
+# CARGO_INCREMENTAL=0 for local runs (see .kiro/steering/testing.md).
+debug = "line-tables-only"
+
+[profile.bench]
+opt-level = 2
+codegen-units = 256
+lto = false
+
+# Release profile: disable LTO for faster links with lower peak memory.
+# The proxy is network-bound, not CPU-bound — LTO gains are negligible.
+[profile.release]
+lto = false
+codegen-units = 16

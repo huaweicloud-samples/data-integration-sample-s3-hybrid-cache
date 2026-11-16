@@ -1,0 +1,25 @@
+# terraform.tfvars.example - Configuration for S3 Hybrid Cache Proxy
+# Copy to terraform.tfvars and fill in the values
+
+region           = "cn-north-4"
+project_id       = "<your-project-id>"
+stack_prefix     = "s3-hybrid-cache"
+
+# VPC
+vpc_cidr        = "192.168.0.0/16"
+subnet_cidr     = "192.168.1.0/24"
+client_cidr     = "0.0.0.0/0"   # Restrict to client network in production
+admin_ip        = "x.x.x.x/32"   # Operator IP for SSH access
+
+# ECS proxy instances
+proxy_flavor          = "c6.large.2"     # 2 vCPUs, 4 GB RAM
+proxy_image           = "Ubuntu 22.04"   # Use a public image with cloud-init
+proxy_instance_count  = 2
+ssh_public_key        = "<your-ssh-public-key>"
+
+# SFS Turbo shared storage
+sfs_turbo_size = 500  # GB
+
+# Proxy configuration
+proxy_binary_url = "https://<bucket>.obs.cn-north-4.myhuaweicloud.com/s3-proxy"
+obs_endpoint     = "obs.cn-north-4.myhuaweicloud.com"

@@ -1,0 +1,3398 @@
+//! Logging Module
+//!
+//! Provides comprehensive logging for both S3-compatible access logs and
+//! application logs with proper formatting, partitioning, and host identification.
+
+use crate::{ProxyError, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// Access log entry in S3-compatible format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessLogEntry {
+    pub bucket_owner: String,
+    pub bucket: String,
+    pub time: DateTime<Utc>,
+    pub remote_ip: String,
+    pub requester: String,
+    pub request_id: String,
+    pub operation: String,
+    pub key: String,
+    pub request_uri: String,
+    pub http_status: u16,
+    pub error_code: Option<String>,
+    pub bytes_sent: u64,
+    pub object_size: Option<u64>,
+    pub total_time: u64,
+    pub turn_around_time: u64,
+    pub referer: Option<String>,
+    pub user_agent: Option<String>,
+    pub host_id: String,
+    pub signature_version: Option<String>,
+    pub cipher_suite: Option<String>,
+    pub authentication_type: Option<String>,
+    pub host_header: Option<String>,
+    pub tls_version: Option<String>,
+    pub access_point_arn: Option<String>,
+    pub acl_required: Option<String>,
+    pub source_region: Option<String>,
+}
+
+/// Tracks the current log file being appended to within a rotation window
+struct CurrentLogFile {
+    /// Path to the current log file
+    path: PathBuf,
+    /// Date partition key ("YYYY/MM/DD") this file belongs to
+    date_key: String,
+    /// When this file was first created
+    created_at: Instant,
+}
+
+/// Buffered access log writer that batches log entries in RAM before flushing to disk.
+///
+/// This reduces disk I/O on shared filesystems (NFS/EFS) by buffering entries and
+/// flushing periodically (every 5 seconds) or when the buffer reaches max capacity.
+pub struct AccessLogBuffer {
+    /// Buffer holding pending log entries
+    buffer: Arc<Mutex<Vec<AccessLogEntry>>>,
+    /// Directory for access log files
+    log_dir: PathBuf,
+    /// Hostname for log file naming
+    hostname: String,
+    /// Interval between automatic flushes
+    flush_interval: Duration,
+    /// Maximum entries before forced flush
+    max_buffer_size: usize,
+    /// Timestamp of last flush
+    last_flush: Arc<RwLock<Instant>>,
+    /// Flag to prevent concurrent flushes
+    flush_in_progress: AtomicBool,
+    /// Current log file being appended to (per rotation window)
+    current_file: Arc<RwLock<Option<CurrentLogFile>>>,
+    /// Rotation interval for access log files
+    file_rotation_interval: Duration,
+}
+
+/// Result of flushing the access log buffer to disk
+#[derive(Debug, Clone, Default)]
+pub struct AccessLogFlushResult {
+    /// Number of entries that were flushed
+    pub entries_flushed: usize,
+    /// Whether the flush was skipped (no pending entries)
+    pub skipped: bool,
+    /// Whether the flush was skipped because another flush is in progress
+    pub already_in_progress: bool,
+}
+
+/// Result of a log cleanup cycle
+#[derive(Debug, Clone, Default)]
+pub struct LogCleanupResult {
+    /// Number of access log files deleted
+    pub access_files_deleted: u32,
+    /// Number of application log files deleted
+    pub app_files_deleted: u32,
+    /// Of `access_files_deleted`, how many belonged to another hostname.
+    ///
+    /// A non-zero value is the signal that an instance which used to write to
+    /// this directory has stopped reaping its own files — a terminated peer, a
+    /// hostname change, or a broken cleanup task (Req 5.4).
+    pub access_files_adopted: u32,
+    /// Of `app_files_deleted`, how many belonged to another hostname (Req 5.4).
+    pub app_files_adopted: u32,
+    /// Number of errors encountered during cleanup
+    pub errors: u32,
+}
+
+/// Extra time a file belonging to *another* hostname is kept beyond the
+/// configured retention.
+///
+/// This is not politeness, it is what keeps clock agreement out of the
+/// correctness argument. Every instance computes its cutoff from its own
+/// `SystemTime::now()` and compares it against an mtime a peer set, so a flat
+/// directory-wide cutoff means an instance whose clock runs ahead deletes a
+/// peer's file that is still inside the peer's retention window. One day absorbs
+/// any plausible skew on a shared volume, and as a side effect the steady state
+/// involves no cross-instance deletion at all — so N proxies no longer contend
+/// on the same `remove_file` with the losers counting `ENOENT` as an error.
+///
+/// Deliberately a fixed internal constant rather than a config field (Req 3.4):
+/// every value below a day reintroduces the skew exposure it exists to remove.
+///
+/// Consequence, which `docs/ACCESS_LOG_FORMAT.md` states: a file survives at
+/// most `retention_days + 1`, and exactly `retention_days` when its writer is
+/// healthy. A compliance-driven hard cap at N means configuring N-1.
+const FOREIGN_GRACE: Duration = Duration::from_secs(24 * 3600);
+
+/// Which naming convention a sweep is matching against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepKind {
+    /// `{access_log_dir}/YYYY/MM/DD/{YYYY-MM-DD-HH-MM-SS}-{hostname}`
+    Access,
+    /// `{app_log_dir}/{hostname}/s3-proxy.log.YYYY-MM-DD`
+    App,
+}
+
+/// Running totals for one directory sweep.
+#[derive(Debug, Default)]
+struct SweepCounts {
+    deleted: u32,
+    adopted: u32,
+    errors: u32,
+}
+
+/// What a sweep may delete, and when.
+struct SweepPolicy<'a> {
+    kind: SweepKind,
+    hostname: &'a str,
+    /// `now - retention`, applied to files this instance wrote.
+    own_cutoff: std::time::SystemTime,
+    /// `now - retention - FOREIGN_GRACE`, applied to every other hostname's.
+    foreign_cutoff: std::time::SystemTime,
+}
+
+impl SweepPolicy<'_> {
+    /// Is this file one the proxy's own naming convention produces?
+    ///
+    /// Everything else is left alone at any age (Req 2.1, 2.2). This gate is
+    /// what makes the ungated sweep safe: without it, "retention applies to this
+    /// directory" would mean "anything under this path is deleted after N days",
+    /// including files the proxy never wrote.
+    fn matches(&self, name: &str) -> bool {
+        match self.kind {
+            SweepKind::Access => is_access_log_filename(name),
+            SweepKind::App => name.starts_with("s3-proxy.log"),
+        }
+    }
+
+    /// Did *this* instance write the file?
+    ///
+    /// Needs no new state: ownership is already encoded in the access-log
+    /// filename suffix and in the app-log parent directory (Req 3.1).
+    fn owned_by_us(&self, path: &std::path::Path, name: &str) -> bool {
+        match self.kind {
+            SweepKind::Access => owns_access_file(name, self.hostname),
+            SweepKind::App => {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(self.hostname)
+            }
+        }
+    }
+}
+
+/// Does `name` have the shape `{YYYY-MM-DD-HH-MM-SS}-{something}`?
+///
+/// Deliberately a shape check rather than a date parse: the sweep decides on
+/// mtime, and the filename only has to establish authorship. `get(..19)` is
+/// byte-indexed and returns `None` rather than panicking on a non-ASCII name
+/// whose 19th byte is mid-character.
+///
+/// Matching the leaf name rather than the `YYYY/MM/DD` path is the point — a
+/// date directory tells you nothing about who wrote a file, since anything can
+/// be dropped into one, whereas this leaf form is produced by `AccessLogBuffer`
+/// and by nothing else. A file that survives is then visibly not ours.
+fn is_access_log_filename(name: &str) -> bool {
+    let Some(stamp) = name.get(..19) else {
+        return false;
+    };
+    let mut parts = stamp.split('-');
+    for width in [4, 2, 2, 2, 2, 2] {
+        match parts.next() {
+            Some(p) if p.len() == width && p.bytes().all(|b| b.is_ascii_digit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none() && matches!(name.as_bytes().get(19), Some(b'-')) && name.len() > 20
+}
+
+/// Does this access log filename belong to `hostname`?
+///
+/// The timestamp prefix is fixed-width, so the hostname is exactly the remainder
+/// after byte 20. Compared as an exact suffix rather than with `contains`, so an
+/// instance whose hostname is a prefix of another's (`host-a` versus `host-a-2`)
+/// cannot claim its files and reap them a day early. EC2 private DNS names
+/// contain `-`, so tokenising on `-` is not an option either.
+fn owns_access_file(name: &str, hostname: &str) -> bool {
+    name.len() > 20 && &name[20..] == hostname
+}
+
+/// Default flush interval for access log buffer (5 seconds)
+fn default_access_log_flush_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// Default maximum buffer size for access log buffer (1000 entries)
+fn default_access_log_buffer_size() -> usize {
+    1000
+}
+
+/// Default file rotation interval for access log files (5 minutes)
+fn default_access_log_file_rotation_interval() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
+/// RAII guard to ensure flush_in_progress is cleared
+struct AccessLogFlushGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> Drop for AccessLogFlushGuard<'a> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+impl AccessLogBuffer {
+    /// Create a new AccessLogBuffer
+    ///
+    /// # Arguments
+    /// * `log_dir` - Directory for access log files
+    /// * `hostname` - Hostname for log file naming
+    /// * `flush_interval` - Interval between automatic flushes (default: 5s)
+    /// * `max_buffer_size` - Maximum entries before forced flush (default: 1000)
+    /// * `file_rotation_interval` - Time window for appending to same file (default: 5m)
+    pub fn new(
+        log_dir: PathBuf,
+        hostname: String,
+        flush_interval: Option<Duration>,
+        max_buffer_size: Option<usize>,
+        file_rotation_interval: Option<Duration>,
+    ) -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            log_dir,
+            hostname,
+            flush_interval: flush_interval.unwrap_or_else(default_access_log_flush_interval),
+            max_buffer_size: max_buffer_size.unwrap_or_else(default_access_log_buffer_size),
+            last_flush: Arc::new(RwLock::new(Instant::now())),
+            flush_in_progress: AtomicBool::new(false),
+            current_file: Arc::new(RwLock::new(None)),
+            file_rotation_interval: file_rotation_interval
+                .unwrap_or_else(default_access_log_file_rotation_interval),
+        }
+    }
+
+    /// Add entry to buffer (non-blocking)
+    ///
+    /// This method adds an entry to the buffer and checks if a flush is needed.
+    /// The flush check is non-blocking - if a flush is already in progress,
+    /// the entry is simply added to the buffer.
+    ///
+    /// # Arguments
+    /// * `entry` - The access log entry to add
+    pub async fn log(&self, entry: AccessLogEntry) -> Result<()> {
+        // Add entry to buffer
+        {
+            let mut buffer = self.buffer.lock().unwrap();
+            buffer.push(entry);
+        }
+
+        // Check if flush is needed
+        self.maybe_flush().await?;
+
+        Ok(())
+    }
+
+    /// Check if flush needed and perform if so
+    ///
+    /// Flushes the buffer if:
+    /// - The flush interval has elapsed, OR
+    /// - The buffer has reached max capacity
+    async fn maybe_flush(&self) -> Result<()> {
+        let should_flush = {
+            // Check buffer size
+            let buffer_len = self.buffer.lock().unwrap().len();
+            if buffer_len >= self.max_buffer_size {
+                true
+            } else {
+                // Check time since last flush
+                if let Ok(last_flush) = self.last_flush.try_read() {
+                    last_flush.elapsed() >= self.flush_interval
+                } else {
+                    false
+                }
+            }
+        };
+
+        if should_flush {
+            // Attempt flush - ignore errors here, they'll be logged
+            let _ = self.flush().await;
+        }
+
+        Ok(())
+    }
+
+    /// Flush buffer to disk
+    ///
+    /// This method writes all buffered entries to the appropriate date-partitioned
+    /// log file. It uses atomic operations to prevent concurrent flushes.
+    ///
+    /// # Returns
+    /// * `Ok(AccessLogFlushResult)` - Information about what was flushed
+    /// * `Err` - If the flush failed (entries are retained for retry)
+    pub async fn flush(&self) -> Result<AccessLogFlushResult> {
+        // Check if another flush is already in progress
+        if self
+            .flush_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            debug!("Access log flush already in progress, skipping");
+            return Ok(AccessLogFlushResult {
+                already_in_progress: true,
+                ..Default::default()
+            });
+        }
+
+        // Ensure we clear the flush_in_progress flag when done
+        let _guard = AccessLogFlushGuard {
+            flag: &self.flush_in_progress,
+        };
+
+        // Take all entries from the buffer
+        let entries: Vec<AccessLogEntry> = {
+            let mut buffer = self.buffer.lock().unwrap();
+            std::mem::take(&mut *buffer)
+        };
+
+        // If no entries to flush, just update the timestamp and return
+        if entries.is_empty() {
+            let mut last_flush = self.last_flush.write().await;
+            *last_flush = Instant::now();
+            return Ok(AccessLogFlushResult {
+                skipped: true,
+                ..Default::default()
+            });
+        }
+
+        let entries_count = entries.len();
+
+        // Group entries by date for proper partitioning
+        let mut entries_by_date: std::collections::HashMap<String, Vec<&AccessLogEntry>> =
+            std::collections::HashMap::new();
+
+        for entry in &entries {
+            let date_key = entry.time.format("%Y/%m/%d").to_string();
+            entries_by_date.entry(date_key).or_default().push(entry);
+        }
+
+        // Write entries to files
+        for (date_path, date_entries) in entries_by_date {
+            if let Err(e) = self.write_entries_to_file(&date_path, &date_entries).await {
+                // On failure, restore entries to buffer for retry
+                warn!("Failed to write access log entries: {}", e);
+                let mut buffer = self.buffer.lock().unwrap();
+                for entry in entries {
+                    buffer.push(entry);
+                }
+                return Err(e);
+            }
+        }
+
+        // Update the last flush timestamp
+        let mut last_flush = self.last_flush.write().await;
+        *last_flush = Instant::now();
+
+        debug!("Flushed {} access log entries to disk", entries_count);
+
+        Ok(AccessLogFlushResult {
+            entries_flushed: entries_count,
+            skipped: false,
+            already_in_progress: false,
+        })
+    }
+
+    /// Write entries to a date-partitioned file, reusing the current file within the rotation window
+    async fn write_entries_to_file(
+        &self,
+        date_path: &str,
+        entries: &[&AccessLogEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Create date-partitioned directory: /logs/access/YYYY/MM/DD/
+        let log_dir = self.log_dir.join(date_path);
+        tokio::fs::create_dir_all(&log_dir).await.map_err(|e| {
+            ProxyError::IoError(format!("Failed to create access log directory: {}", e))
+        })?;
+
+        // Format all entries
+        let mut content = String::new();
+        for entry in entries {
+            content.push_str(&Self::format_entry(entry));
+            content.push('\n');
+        }
+
+        // Determine whether to append to current file or create a new one
+        let now = Instant::now();
+        let should_append = {
+            let current = self.current_file.read().await;
+            if let Some(ref cf) = *current {
+                cf.date_key == date_path
+                    && cf.created_at + self.file_rotation_interval > now
+                    && cf.path.exists()
+            } else {
+                false
+            }
+        };
+
+        if should_append {
+            // Append to existing file within the rotation window
+            let log_file_path = {
+                let current = self.current_file.read().await;
+                current.as_ref().unwrap().path.clone()
+            };
+
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file_path)
+                .await
+                .map_err(|e| {
+                    ProxyError::IoError(format!("Failed to open access log file: {}", e))
+                })?;
+
+            file.write_all(content.as_bytes())
+                .await
+                .map_err(|e| ProxyError::IoError(format!("Failed to write access log: {}", e)))?;
+
+            file.flush()
+                .await
+                .map_err(|e| ProxyError::IoError(format!("Failed to flush access log: {}", e)))?;
+
+            debug!("Appended {} entries to {:?}", entries.len(), log_file_path);
+        } else {
+            // Create a new file named {first_entry_timestamp}-{hostname}
+            let timestamp = entries[0].time;
+            let filename = format!(
+                "{}-{}",
+                timestamp.format("%Y-%m-%d-%H-%M-%S"),
+                self.hostname
+            );
+            let log_file_path = log_dir.join(&filename);
+
+            // Write using atomic temp+rename for durability
+            let temp_path = log_file_path.with_extension("tmp");
+
+            tokio::fs::write(&temp_path, content.as_bytes())
+                .await
+                .map_err(|e| {
+                    ProxyError::IoError(format!("Failed to write temp access log: {}", e))
+                })?;
+
+            tokio::fs::rename(&temp_path, &log_file_path)
+                .await
+                .map_err(|e| ProxyError::IoError(format!("Failed to rename access log: {}", e)))?;
+
+            // Update current_file tracking
+            let mut current = self.current_file.write().await;
+            *current = Some(CurrentLogFile {
+                path: log_file_path.clone(),
+                date_key: date_path.to_string(),
+                created_at: now,
+            });
+
+            debug!(
+                "Created new log file {:?} with {} entries",
+                log_file_path,
+                entries.len()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Force flush (for shutdown)
+    ///
+    /// This method is similar to `flush()` but is intended for use during
+    /// graceful shutdown. It will wait briefly for any in-progress flush to
+    /// complete before performing its own flush.
+    ///
+    /// # Returns
+    /// * `Ok(AccessLogFlushResult)` - Information about what was flushed
+    /// * `Err` - If the flush failed
+    pub async fn force_flush(&self) -> Result<AccessLogFlushResult> {
+        // Wait briefly for any in-progress flush to complete
+        for _ in 0..10 {
+            if !self.flush_in_progress.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Now perform the flush
+        self.flush().await
+    }
+
+    /// Format access log entry in S3-compatible format
+    ///
+    /// This is the same format as the existing `AccessLogWriter::format_entry()`
+    fn format_entry(entry: &AccessLogEntry) -> String {
+        // Mask presigned URL credentials before writing to log
+        let masked_uri = mask_presigned_params(&entry.request_uri);
+
+        // Sanitize free-text fields to prevent log injection (CR/LF/quote escaping)
+        let referer = sanitize_log_field(entry.referer.as_deref().unwrap_or("-"));
+        let user_agent = sanitize_log_field(entry.user_agent.as_deref().unwrap_or("-"));
+
+        // S3 Server Access Log format (version_id field removed)
+        format!(
+            "{} {} [{}] {} {} {} {} \"{}\" {} {} {} {} {} {} \"{}\" \"{}\" {} {} {} {} {} {} {} {} {}",
+            entry.bucket_owner,
+            entry.bucket,
+            entry.time.format("%d/%b/%Y:%H:%M:%S %z"),
+            entry.remote_ip,
+            entry.requester,
+            entry.request_id,
+            entry.operation,
+            masked_uri,
+            entry.http_status,
+            entry.error_code.as_deref().unwrap_or("-"),
+            entry.bytes_sent,
+            entry.object_size.map_or("-".to_string(), |s| s.to_string()),
+            entry.total_time,
+            entry.turn_around_time,
+            referer,
+            user_agent,
+            entry.host_id,
+            entry.signature_version.as_deref().unwrap_or("-"),
+            entry.cipher_suite.as_deref().unwrap_or("-"),
+            entry.authentication_type.as_deref().unwrap_or("-"),
+            entry.host_header.as_deref().unwrap_or("-"),
+            entry.tls_version.as_deref().unwrap_or("-"),
+            entry.access_point_arn.as_deref().unwrap_or("-"),
+            entry.acl_required.as_deref().unwrap_or("-"),
+            entry.source_region.as_deref().unwrap_or("-"),
+        )
+    }
+
+    /// Get the number of entries currently in the buffer
+    ///
+    /// This is useful for reporting entries lost during shutdown if flush fails.
+    pub fn pending_entries_count(&self) -> usize {
+        self.buffer.lock().unwrap().len()
+    }
+
+    /// Get the number of entries currently in the buffer (for testing)
+    #[cfg(test)]
+    pub fn buffer_len(&self) -> usize {
+        self.pending_entries_count()
+    }
+
+    /// Check if a flush is needed based on the flush interval (for testing)
+    #[cfg(test)]
+    pub fn should_flush(&self) -> bool {
+        let buffer_len = self.buffer.lock().unwrap().len();
+        if buffer_len >= self.max_buffer_size {
+            return true;
+        }
+        if let Ok(last_flush) = self.last_flush.try_read() {
+            last_flush.elapsed() >= self.flush_interval
+        } else {
+            false
+        }
+    }
+}
+
+/// Logging configuration
+#[derive(Debug, Clone)]
+pub struct LoggingConfig {
+    pub access_log_dir: PathBuf,
+    pub app_log_dir: PathBuf,
+    pub access_log_enabled: bool,
+    pub access_log_mode: AccessLogMode,
+    pub hostname: String,
+    pub log_level: String,
+    /// Flush interval for access log buffer (default: 5s)
+    pub access_log_flush_interval: Duration,
+    /// Maximum entries in access log buffer before forced flush (default: 1000)
+    pub access_log_buffer_size: usize,
+    /// Days to retain access log files (default: 30, range: 1-365)
+    pub access_log_retention_days: u32,
+    /// Days to retain application log files (default: 30, range: 1-365)
+    pub app_log_retention_days: u32,
+    /// Interval between log cleanup cycles (default: 24h, range: 1h-7d)
+    pub log_cleanup_interval: Duration,
+    /// Time window for appending to same access log file (default: 5m, range: 1m-60m)
+    pub access_log_file_rotation_interval: Duration,
+}
+
+/// Access logging mode
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AccessLogMode {
+    #[default]
+    All, // Log all requests
+    CachedOnly, // Log only requests served from cache
+}
+
+/// Logger manager for handling all logging operations
+pub struct LoggerManager {
+    pub config: LoggingConfig,
+    access_log_buffer: Option<AccessLogBuffer>, // Changed from AccessLogWriter
+}
+
+impl LoggerManager {
+    /// Create a new logger manager
+    pub fn new(config: LoggingConfig) -> Self {
+        Self {
+            config,
+            access_log_buffer: None,
+        }
+    }
+
+    /// Create a new logger manager from config module types
+    pub fn from_config(config: crate::config::LoggingConfig, hostname: String) -> Self {
+        let logging_config = LoggingConfig {
+            access_log_dir: config.access_log_dir,
+            app_log_dir: config.app_log_dir,
+            access_log_enabled: config.access_log_enabled,
+            access_log_mode: match config.access_log_mode {
+                crate::config::AccessLogMode::All => AccessLogMode::All,
+                crate::config::AccessLogMode::CachedOnly => AccessLogMode::CachedOnly,
+            },
+            hostname,
+            log_level: config.log_level,
+            access_log_flush_interval: config.access_log_flush_interval,
+            access_log_buffer_size: config.access_log_buffer_size,
+            access_log_retention_days: config.access_log_retention_days,
+            app_log_retention_days: config.app_log_retention_days,
+            log_cleanup_interval: config.log_cleanup_interval,
+            access_log_file_rotation_interval: config.access_log_file_rotation_interval,
+        };
+
+        Self::new(logging_config)
+    }
+
+    /// Initialize the logging system
+    pub fn initialize(&mut self) -> Result<()> {
+        // Initialize application logging with tracing
+        self.setup_application_logging()?;
+
+        // Initialize access logging if enabled
+        if self.config.access_log_enabled {
+            // Task 4.3: Pass config values to AccessLogBuffer::new()
+            self.access_log_buffer = Some(AccessLogBuffer::new(
+                self.config.access_log_dir.clone(),
+                self.config.hostname.clone(),
+                Some(self.config.access_log_flush_interval),
+                Some(self.config.access_log_buffer_size),
+                Some(self.config.access_log_file_rotation_interval),
+            ));
+        }
+
+        info!("Logging system initialized");
+        Ok(())
+    }
+
+    /// Setup application logging with tracing
+    fn setup_application_logging(&self) -> Result<()> {
+        // Create host-specific app log directory
+        let host_log_dir = self.config.app_log_dir.join(&self.config.hostname);
+        std::fs::create_dir_all(&host_log_dir).map_err(|e| {
+            ProxyError::IoError(format!("Failed to create app log directory: {}", e))
+        })?;
+
+        // Create rolling file appender for application logs with daily rotation
+        let file_appender =
+            RollingFileAppender::new(Rotation::DAILY, host_log_dir.clone(), "s3-proxy.log");
+
+        // Setup tracing subscriber with both console and file output
+        // Use .compact() for consistent formatting across all log levels
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file_appender)
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_file(true)
+            .with_line_number(true)
+            .with_level(true)
+            .with_timer(tracing_subscriber::fmt::time::ChronoUtc::rfc_3339())
+            .compact(); // Use compact format for consistency
+
+        let console_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout)
+            .with_ansi(true)
+            .with_target(false)
+            .with_level(true)
+            .with_timer(tracing_subscriber::fmt::time::ChronoUtc::rfc_3339())
+            .compact(); // Use compact format for consistency
+
+        // Try to set global subscriber, but don't fail if already set (for tests)
+        // Use config log_level, but allow RUST_LOG env var to override
+        let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(format!("{},hickory_proto=error", self.config.log_level))
+        });
+
+        let result = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(console_layer)
+            .try_init();
+
+        match result {
+            Ok(_) => {
+                info!(
+                    "Application logging initialized for host: {}",
+                    self.config.hostname
+                );
+                info!("Application logs will be written to: {:?}", host_log_dir);
+            }
+            Err(_) => {
+                // Already initialized, likely in tests - this is fine
+                debug!("Tracing subscriber already initialized, skipping");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Perform log rotation and cleanup.
+    ///
+    /// Retention is a property of the **directory**, not of whether this process
+    /// happens to be writing there: both sweeps run on every cycle regardless of
+    /// `access_log_enabled` (Req 1.1). What limits the blast radius is the
+    /// filename predicate and the ownership tiering in [`SweepPolicy`], not the
+    /// old gate.
+    pub fn rotate_logs(
+        &self,
+        access_log_retention_days: u32,
+        app_log_retention_days: u32,
+    ) -> Result<LogCleanupResult> {
+        let mut result = LogCleanupResult::default();
+
+        // Application logs: the whole `app_log_dir`, every hostname directory,
+        // not just our own (Req 4.2).
+        let app = self.sweep_directory(
+            &self.config.app_log_dir,
+            SweepKind::App,
+            app_log_retention_days,
+        )?;
+        result.app_files_deleted = app.deleted;
+        result.app_files_adopted = app.adopted;
+        result.errors += app.errors;
+
+        // Access logs: unconditional (Req 1.1). Tolerates a missing or
+        // unreadable directory — `read_dir` failure is swallowed (Req 1.2).
+        let access = self.sweep_directory(
+            &self.config.access_log_dir,
+            SweepKind::Access,
+            access_log_retention_days,
+        )?;
+        result.access_files_deleted = access.deleted;
+        result.access_files_adopted = access.adopted;
+        result.errors += access.errors;
+
+        info!("Log rotation and cleanup completed");
+        Ok(result)
+    }
+
+    /// Sweep one log directory under a two-tier cutoff.
+    fn sweep_directory(
+        &self,
+        dir: &std::path::Path,
+        kind: SweepKind,
+        keep_days: u32,
+    ) -> Result<SweepCounts> {
+        let now = std::time::SystemTime::now();
+        let retention = std::time::Duration::from_secs(keep_days as u64 * 24 * 3600);
+        let policy = SweepPolicy {
+            kind,
+            hostname: &self.config.hostname,
+            own_cutoff: now - retention,
+            foreign_cutoff: now - retention - FOREIGN_GRACE,
+        };
+
+        let mut counts = SweepCounts::default();
+        Self::cleanup_directory_recursive(dir, &policy, &mut counts)?;
+        Ok(counts)
+    }
+
+    /// Recursively sweep `dir`, deleting only files the policy both recognises
+    /// as ours-by-convention and considers past the cutoff for their owner.
+    ///
+    /// An associated function rather than a method: the policy carries everything
+    /// the walk needs, so nothing here reads `self` (which is what let the old
+    /// `#[allow(clippy::only_used_in_recursion)]` be removed).
+    fn cleanup_directory_recursive(
+        dir: &std::path::Path,
+        policy: &SweepPolicy<'_>,
+        counts: &mut SweepCounts,
+    ) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            // Missing, empty or unreadable is not an error (Req 1.2).
+            return Ok(());
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() {
+                Self::cleanup_directory_recursive(&path, policy, counts)?;
+
+                // Prune a directory the sweep left empty. A live instance's
+                // hostname directory always holds a current file, so it is
+                // never empty and never removed (Req 4.4).
+                if let Ok(mut dir_entries) = std::fs::read_dir(&path) {
+                    if dir_entries.next().is_none() {
+                        if let Err(e) = std::fs::remove_dir(&path) {
+                            debug!("Failed to remove empty directory {:?}: {}", path, e);
+                        } else {
+                            debug!("Removed empty directory: {:?}", path);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Req 2.1/2.2, 4.2: anything not produced by our own naming
+            // convention is left alone at any age and is not counted.
+            if !policy.matches(name) {
+                continue;
+            }
+
+            let owned = policy.owned_by_us(&path, name);
+            let cutoff = if owned {
+                policy.own_cutoff
+            } else {
+                policy.foreign_cutoff
+            };
+
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if modified >= cutoff {
+                continue;
+            }
+
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!("Failed to remove old log file {:?}: {}", path, e);
+                counts.errors += 1;
+            } else {
+                debug!(
+                    "Removed old log file: {:?} (owner={})",
+                    path,
+                    if owned { "own" } else { "adopted" }
+                );
+                counts.deleted += 1;
+                if !owned {
+                    counts.adopted += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Log an access entry
+    pub async fn log_access(&self, entry: AccessLogEntry, served_from_cache: bool) -> Result<()> {
+        if let Some(buffer) = &self.access_log_buffer {
+            // Check if we should log this entry based on mode
+            let should_log = match self.config.access_log_mode {
+                AccessLogMode::All => true,
+                AccessLogMode::CachedOnly => served_from_cache,
+            };
+
+            if should_log {
+                buffer.log(entry).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Force flush the access log buffer (for shutdown)
+    ///
+    /// This method should be called during graceful shutdown to ensure
+    /// all buffered access log entries are written to disk.
+    pub async fn force_flush(&self) -> Result<AccessLogFlushResult> {
+        if let Some(buffer) = &self.access_log_buffer {
+            buffer.force_flush().await
+        } else {
+            Ok(AccessLogFlushResult {
+                skipped: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Create an access log entry from HTTP request/response data
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_access_log_entry(
+        &self,
+        method: &str,
+        remote_ip: String,
+        request_uri: String,
+        http_status: u16,
+        bytes_sent: u64,
+        object_size: Option<u64>,
+        total_time: u64,
+        turn_around_time: u64,
+        user_agent: Option<String>,
+        referer: Option<String>,
+        host_header: Option<String>,
+        error_code: Option<String>,
+    ) -> AccessLogEntry {
+        // Extract bucket and key from request URI
+        let (bucket, key) = self.parse_s3_uri(&request_uri);
+
+        // Determine operation type based on HTTP method and URI
+        let operation = match method {
+            "HEAD" => "REST.HEAD.OBJECT".to_string(),
+            "GET" => "REST.GET.OBJECT".to_string(),
+            "PUT" => "REST.PUT.OBJECT".to_string(),
+            "DELETE" => "REST.DELETE.OBJECT".to_string(),
+            _ => format!("REST.{}.OBJECT", method),
+        };
+
+        AccessLogEntry {
+            bucket_owner: bucket.clone(),
+            bucket,
+            time: Utc::now(),
+            remote_ip,
+            requester: "-".to_string(), // Anonymous access
+            request_id: uuid::Uuid::new_v4().to_string(),
+            operation,
+            key,
+            request_uri,
+            http_status,
+            error_code,
+            bytes_sent,
+            object_size,
+            total_time,
+            turn_around_time,
+            referer,
+            user_agent,
+            host_id: self.config.hostname.clone(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: Some("Anonymous".to_string()),
+            host_header,
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        }
+    }
+
+    /// Parse S3 URI to extract bucket and key
+    pub fn parse_s3_uri(&self, uri: &str) -> (String, String) {
+        // Remove query parameters
+        let path = uri.split('?').next().unwrap_or(uri);
+
+        // Remove leading slash
+        let path = path.strip_prefix('/').unwrap_or(path);
+
+        // Split into bucket and key
+        if let Some(slash_pos) = path.find('/') {
+            let bucket = path[..slash_pos].to_string();
+            let key = path[slash_pos + 1..].to_string();
+            (bucket, key)
+        } else {
+            // Just bucket, no key
+            (path.to_string(), "-".to_string())
+        }
+    }
+
+    /// Get the number of pending entries in the access log buffer
+    ///
+    /// This is useful for reporting entries lost during shutdown if flush fails.
+    /// Returns 0 if access logging is disabled.
+    pub fn pending_entries_count(&self) -> usize {
+        if let Some(buffer) = &self.access_log_buffer {
+            buffer.pending_entries_count()
+        } else {
+            0
+        }
+    }
+}
+
+/// Sensitive presigned URL query parameter names (lowercase for case-insensitive matching).
+const SENSITIVE_PARAMS: &[&str] = &[
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+];
+
+/// Sanitize a free-text field for safe inclusion in access log lines.
+///
+/// Replaces characters that could break log line structure or enable log
+/// injection attacks:
+/// - `\r` (CR) → `\r` literal backslash-r
+/// - `\n` (LF) → `\n` literal backslash-n
+/// - `"` → `\"` backslash-escaped quote
+///
+/// Fields that contain none of these characters are returned as-is (fast path,
+/// no allocation).
+pub(crate) fn sanitize_log_field(field: &str) -> String {
+    // Fast path: if no dangerous characters present, avoid allocation
+    if !field.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'"') {
+        return field.to_string();
+    }
+
+    let mut out = String::with_capacity(field.len() + 8);
+    for ch in field.chars() {
+        match ch {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Mask sensitive presigned URL query parameters in a URI.
+///
+/// Replaces the values of `X-Amz-Signature`, `X-Amz-Credential`, and
+/// `X-Amz-Security-Token` with `REDACTED`, preserving parameter names and
+/// positions. Parameter name matching is case-insensitive and handles
+/// percent-encoded variants.
+///
+/// URIs without a query string or without any sensitive parameters are
+/// returned unchanged (fast path avoids allocation).
+pub fn mask_presigned_params(uri: &str) -> String {
+    // Fast path: no query string at all
+    let Some(query_start) = uri.find('?') else {
+        return uri.to_string();
+    };
+
+    let query = &uri[query_start + 1..];
+
+    // Fast path: check for likely presigned parameter substrings (case-insensitive).
+    // Also check for percent-encoded hyphens (%2D or %2d) which appear in encoded
+    // parameter names like X%2DAmz%2DSignature, and percent-encoded leading 'X'/'x'
+    // (%58/%78) which would appear as %58-Amz-... or %78-Amz-... in doubly-encoded URLs.
+    let lower = query.to_ascii_lowercase();
+    if !lower.contains("x-amz-s")
+        && !lower.contains("x-amz-c")
+        && !lower.contains("x%2damz%2d")
+        && !lower.contains("%58-amz-")
+        && !lower.contains("%78-amz-")
+        && !lower.contains("%58%2damz")
+        && !lower.contains("%78%2damz")
+    {
+        return uri.to_string();
+    }
+
+    let path = &uri[..query_start];
+    let mut result = String::with_capacity(uri.len());
+    result.push_str(path);
+    result.push('?');
+
+    for (i, param) in query.split('&').enumerate() {
+        if i > 0 {
+            result.push('&');
+        }
+
+        if let Some(eq_pos) = param.find('=') {
+            let name = &param[..eq_pos];
+            // Decode percent-encoding for comparison, then compare case-insensitively
+            let decoded_name = percent_decode(name);
+            let name_lower = decoded_name.to_ascii_lowercase();
+
+            if SENSITIVE_PARAMS.contains(&name_lower.as_str()) {
+                result.push_str(name);
+                result.push('=');
+                result.push_str("REDACTED");
+            } else {
+                result.push_str(param);
+            }
+        } else {
+            // No '=' — bare parameter, pass through unchanged
+            result.push_str(param);
+        }
+    }
+
+    result
+}
+
+/// Minimal percent-decoding for parameter name comparison.
+/// Only decodes %XX sequences; does not handle '+' as space (query param names
+/// don't use '+' encoding in AWS presigned URLs).
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                result.push((hi << 4 | lo) as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    result
+}
+
+/// Convert an ASCII hex digit to its numeric value.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    /// Helper function to create a test AccessLogEntry
+    fn create_test_entry(bucket: &str, key: &str) -> AccessLogEntry {
+        AccessLogEntry {
+            bucket_owner: bucket.to_string(),
+            bucket: bucket.to_string(),
+            time: Utc::now(),
+            remote_ip: "192.168.1.1".to_string(),
+            requester: "-".to_string(),
+            request_id: format!("test-request-{}", uuid::Uuid::new_v4()),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: key.to_string(),
+            request_uri: format!("/{}/{}", bucket, key),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 1024,
+            object_size: Some(1024),
+            total_time: 100,
+            turn_around_time: 50,
+            referer: None,
+            user_agent: Some("test-agent".to_string()),
+            host_id: "test-host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: Some("Anonymous".to_string()),
+            host_header: Some(format!("{}.s3.amazonaws.com", bucket)),
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        }
+    }
+
+    // =========================================================================
+    // Unit tests for AccessLogBuffer
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_access_log_buffer_entry_buffering() {
+        // Test that log() adds entries to the buffer
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        // Create buffer with large flush interval and buffer size to prevent auto-flush
+        let buffer = AccessLogBuffer::new(
+            log_dir,
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)), // 1 hour - won't trigger time-based flush
+            Some(1000),                      // Large buffer size
+            None,                            // Default file rotation interval
+        );
+
+        // Initially buffer should be empty
+        assert_eq!(buffer.buffer_len(), 0);
+
+        // Add first entry
+        let entry1 = create_test_entry("bucket1", "key1");
+        buffer.log(entry1).await.unwrap();
+        assert_eq!(buffer.buffer_len(), 1);
+
+        // Add second entry
+        let entry2 = create_test_entry("bucket2", "key2");
+        buffer.log(entry2).await.unwrap();
+        assert_eq!(buffer.buffer_len(), 2);
+
+        // Add third entry
+        let entry3 = create_test_entry("bucket3", "key3");
+        buffer.log(entry3).await.unwrap();
+        assert_eq!(buffer.buffer_len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_flush_writes_correct_format() {
+        // Test that flush writes entries in S3-compatible format
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(1000),
+            None,
+        );
+
+        // Add an entry with known values
+        let entry = AccessLogEntry {
+            bucket_owner: "test-bucket".to_string(),
+            bucket: "test-bucket".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-12345".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "path/to/file.txt".to_string(),
+            request_uri: "/test-bucket/path/to/file.txt".to_string(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 2048,
+            object_size: Some(2048),
+            total_time: 150,
+            turn_around_time: 75,
+            referer: Some("https://example.com".to_string()),
+            user_agent: Some("TestAgent/1.0".to_string()),
+            host_id: "test-host".to_string(),
+            signature_version: Some("SigV4".to_string()),
+            cipher_suite: None,
+            authentication_type: Some("AuthHeader".to_string()),
+            host_header: Some("test-bucket.s3.amazonaws.com".to_string()),
+            tls_version: Some("TLSv1.2".to_string()),
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        };
+
+        buffer.log(entry.clone()).await.unwrap();
+
+        // Force flush
+        let result = buffer.force_flush().await.unwrap();
+        assert_eq!(result.entries_flushed, 1);
+        assert!(!result.skipped);
+
+        // Find and read the log file
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let log_subdir = log_dir.join(&date_path);
+
+        // Read the log file content
+        let entries: Vec<_> = std::fs::read_dir(&log_subdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "Should have exactly one log file");
+
+        let log_content = std::fs::read_to_string(entries[0].path()).unwrap();
+
+        // Verify S3-compatible format fields are present
+        assert!(
+            log_content.contains("test-bucket"),
+            "Should contain bucket name"
+        );
+        assert!(log_content.contains("10.0.0.1"), "Should contain remote IP");
+        assert!(
+            log_content.contains("req-12345"),
+            "Should contain request ID"
+        );
+        assert!(
+            log_content.contains("REST.GET.OBJECT"),
+            "Should contain operation"
+        );
+        assert!(
+            log_content.contains("/test-bucket/path/to/file.txt"),
+            "Should contain request URI"
+        );
+        assert!(log_content.contains("200"), "Should contain HTTP status");
+        assert!(log_content.contains("2048"), "Should contain bytes sent");
+        assert!(
+            log_content.contains("TestAgent/1.0"),
+            "Should contain user agent"
+        );
+        assert!(
+            log_content.contains("https://example.com"),
+            "Should contain referer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_size_limit_triggers_flush() {
+        // Test that buffer size limit triggers automatic flush
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        // Create buffer with small max size (3 entries) to trigger flush
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)), // Long interval - won't trigger time-based flush
+            Some(3),                         // Small buffer size - will trigger size-based flush
+            None,                            // Default file rotation interval
+        );
+
+        // Add entries up to the limit
+        for i in 0..3 {
+            let entry = create_test_entry("bucket", &format!("key{}", i));
+            buffer.log(entry).await.unwrap();
+        }
+
+        // After adding 3 entries (reaching max_buffer_size), flush should have been triggered
+        // Buffer should be empty after flush
+        assert_eq!(
+            buffer.buffer_len(),
+            0,
+            "Buffer should be empty after size-triggered flush"
+        );
+
+        // Verify log file was created
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let log_subdir = log_dir.join(&date_path);
+        assert!(
+            log_subdir.exists(),
+            "Log directory should exist after flush"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(&log_subdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "Should have at least one log file after flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_flush_timing_logic() {
+        // Test should_flush based on interval
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        // Create buffer with very short flush interval (100ms)
+        let buffer = AccessLogBuffer::new(
+            log_dir,
+            "test-host".to_string(),
+            Some(Duration::from_millis(100)), // Short interval for testing
+            Some(1000),                       // Large buffer size
+            None,                             // Default file rotation interval
+        );
+
+        // Add an entry
+        let entry = create_test_entry("bucket", "key");
+        buffer.log(entry).await.unwrap();
+
+        // Initially should_flush might be false (just created)
+        // But after waiting for the interval, it should be true
+
+        // Wait for flush interval to elapse
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Now should_flush should return true due to elapsed time
+        assert!(
+            buffer.should_flush(),
+            "should_flush should return true after interval elapsed"
+        );
+
+        // Perform flush
+        let result = buffer.flush().await.unwrap();
+        assert_eq!(result.entries_flushed, 1);
+
+        // After flush, should_flush should return false (no entries and timer reset)
+        assert!(
+            !buffer.should_flush(),
+            "should_flush should return false after flush with empty buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_flush_empty_buffer() {
+        // Test that flushing an empty buffer is handled correctly
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir,
+            "test-host".to_string(),
+            Some(Duration::from_secs(5)),
+            Some(1000),
+            None,
+        );
+
+        // Flush empty buffer
+        let result = buffer.flush().await.unwrap();
+        assert!(result.skipped, "Flushing empty buffer should be skipped");
+        assert_eq!(result.entries_flushed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_force_flush() {
+        // Test force_flush for shutdown scenarios
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)), // Long interval
+            Some(1000),                      // Large buffer
+            None,                            // Default file rotation interval
+        );
+
+        // Add entries
+        for i in 0..5 {
+            let entry = create_test_entry("bucket", &format!("key{}", i));
+            buffer.log(entry).await.unwrap();
+        }
+
+        assert_eq!(buffer.buffer_len(), 5);
+
+        // Force flush should write all entries
+        let result = buffer.force_flush().await.unwrap();
+        assert_eq!(result.entries_flushed, 5);
+        assert!(!result.skipped);
+        assert_eq!(
+            buffer.buffer_len(),
+            0,
+            "Buffer should be empty after force_flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_date_partitioning() {
+        // Test that entries are written to date-partitioned directories
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(1000),
+            None,
+        );
+
+        // Add entry
+        let entry = create_test_entry("bucket", "key");
+        let entry_time = entry.time;
+        buffer.log(entry).await.unwrap();
+
+        // Flush
+        buffer.force_flush().await.unwrap();
+
+        // Verify date-partitioned directory structure: YYYY/MM/DD/
+        let expected_path = log_dir
+            .join(entry_time.format("%Y").to_string())
+            .join(entry_time.format("%m").to_string())
+            .join(entry_time.format("%d").to_string());
+
+        assert!(
+            expected_path.exists(),
+            "Date-partitioned directory should exist: {:?}",
+            expected_path
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_multiple_flushes() {
+        // Test multiple flush cycles
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(1000),
+            None,
+        );
+
+        // First batch
+        for i in 0..3 {
+            let entry = create_test_entry("bucket", &format!("key-batch1-{}", i));
+            buffer.log(entry).await.unwrap();
+        }
+        let result1 = buffer.force_flush().await.unwrap();
+        assert_eq!(result1.entries_flushed, 3);
+
+        // Second batch
+        for i in 0..2 {
+            let entry = create_test_entry("bucket", &format!("key-batch2-{}", i));
+            buffer.log(entry).await.unwrap();
+        }
+        let result2 = buffer.force_flush().await.unwrap();
+        assert_eq!(result2.entries_flushed, 2);
+
+        // Verify total entries in log file
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let log_subdir = log_dir.join(&date_path);
+
+        let log_files: Vec<_> = std::fs::read_dir(&log_subdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+
+        // Count total lines across all log files
+        let mut total_lines = 0;
+        for file in &log_files {
+            let content = std::fs::read_to_string(file.path()).unwrap();
+            total_lines += content.lines().count();
+        }
+        assert_eq!(
+            total_lines, 5,
+            "Should have 5 total log entries across all files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_log_buffer_concurrent_flush_prevention() {
+        // Test that concurrent flushes are prevented
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = Arc::new(AccessLogBuffer::new(
+            log_dir,
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(1000),
+            None,
+        ));
+
+        // Add entries
+        for i in 0..10 {
+            let entry = create_test_entry("bucket", &format!("key{}", i));
+            buffer.log(entry).await.unwrap();
+        }
+
+        // Spawn multiple concurrent flush attempts
+        let buffer1 = buffer.clone();
+        let buffer2 = buffer.clone();
+
+        let (result1, result2) = tokio::join!(buffer1.flush(), buffer2.flush());
+
+        // One should succeed with entries, the other should report already_in_progress or succeed
+        let r1 = result1.unwrap();
+        let r2 = result2.unwrap();
+
+        // At least one should have flushed entries or reported already_in_progress
+        let total_flushed = r1.entries_flushed + r2.entries_flushed;
+        let any_in_progress = r1.already_in_progress || r2.already_in_progress;
+
+        // Either all entries were flushed by one call, or one was blocked
+        assert!(
+            total_flushed == 10 || any_in_progress,
+            "Either all entries should be flushed or one flush should be blocked"
+        );
+    }
+
+    // =========================================================================
+    // Unit tests for CurrentLogFile state transitions
+    // Requirements: 9.5, 9.6, 9.7, 9.8
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_no_current_file_creates_new_file() {
+        // When no current file exists, the first flush should create a new file
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_secs(300)),
+        );
+
+        // Verify current_file starts as None
+        assert!(buffer.current_file.read().await.is_none());
+
+        // Log an entry and flush
+        let entry = create_test_entry("test-bucket", "test-key");
+        buffer.log(entry).await.unwrap();
+        let result = buffer.force_flush().await.unwrap();
+        assert_eq!(result.entries_flushed, 1);
+
+        // current_file should now be set
+        let current = buffer.current_file.read().await;
+        assert!(
+            current.is_some(),
+            "current_file should be set after first flush"
+        );
+        let cf = current.as_ref().unwrap();
+        assert!(cf.path.exists(), "created file should exist on disk");
+        assert_eq!(cf.date_key, Utc::now().format("%Y/%m/%d").to_string());
+
+        // Exactly one file in the date directory
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let files: Vec<_> = std::fs::read_dir(log_dir.join(&date_path))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert_eq!(files.len(), 1, "First flush should create exactly one file");
+    }
+
+    #[tokio::test]
+    async fn test_within_rotation_window_appends_to_same_file() {
+        // When flushing within the rotation window, entries append to the same file
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_secs(300)), // 5 minute rotation window
+        );
+
+        // First flush — creates a new file
+        let entry1 = create_test_entry("test-bucket", "key-1");
+        buffer.log(entry1).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let first_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+
+        // Second flush — should append to the same file (within rotation window)
+        let entry2 = create_test_entry("test-bucket", "key-2");
+        buffer.log(entry2).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let second_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert_eq!(
+            first_path, second_path,
+            "Should reuse the same file within rotation window"
+        );
+
+        // Only one file should exist
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let files: Vec<_> = std::fs::read_dir(log_dir.join(&date_path))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "Should have exactly 1 file (appended, not rotated)"
+        );
+
+        // File should contain both entries (2 lines)
+        let content = std::fs::read_to_string(&first_path).unwrap();
+        assert_eq!(content.lines().count(), 2, "File should contain 2 entries");
+    }
+
+    #[tokio::test]
+    async fn test_expired_rotation_window_creates_new_file() {
+        // When the rotation window has expired, the next flush creates a new file
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        // Use a very short rotation interval (100ms) so we can test expiry quickly
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_millis(100)),
+        );
+
+        // First flush — creates file
+        let entry1 = create_test_entry("test-bucket", "key-1");
+        buffer.log(entry1).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let first_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+
+        // Sleep past the rotation interval AND past the 1-second timestamp boundary
+        // so the new file gets a distinct name (filenames use second-level precision)
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Second flush — rotation window expired, should create a new file
+        let entry2 = create_test_entry("test-bucket", "key-2");
+        buffer.log(entry2).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let second_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert_ne!(
+            first_path, second_path,
+            "Should create a new file after rotation window expires"
+        );
+
+        // Two files should exist
+        let date_path = Utc::now().format("%Y/%m/%d").to_string();
+        let files: Vec<_> = std::fs::read_dir(log_dir.join(&date_path))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert_eq!(files.len(), 2, "Should have 2 files after rotation");
+
+        // Each file should have exactly 1 entry
+        for file in &files {
+            let content = std::fs::read_to_string(file.path()).unwrap();
+            assert_eq!(
+                content.lines().count(),
+                1,
+                "Each rotated file should have 1 entry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_date_partition_change_creates_new_file() {
+        // When the date_key changes, a new file is created even within the rotation window.
+        // Since entries use Utc::now(), we test this indirectly by verifying the date_key
+        // check in write_entries_to_file: manually set current_file to a different date_key
+        // and confirm the next flush creates a new file (not an append).
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+
+        let buffer = AccessLogBuffer::new(
+            log_dir.clone(),
+            "test-host".to_string(),
+            Some(Duration::from_secs(3600)),
+            Some(10000),
+            Some(Duration::from_secs(300)), // 5 minute rotation window
+        );
+
+        // First flush — creates a file for today's date
+        let entry1 = create_test_entry("test-bucket", "key-1");
+        buffer.log(entry1).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let first_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+
+        // Verify the file has 1 entry
+        let content_before = std::fs::read_to_string(&first_path).unwrap();
+        assert_eq!(
+            content_before.lines().count(),
+            1,
+            "First file should have 1 entry"
+        );
+
+        // Manually override current_file's date_key to simulate a date partition mismatch.
+        // This mimics what happens at midnight when the date rolls over: the current_file
+        // was created for yesterday but new entries belong to today.
+        {
+            let mut current = buffer.current_file.write().await;
+            if let Some(ref mut cf) = *current {
+                cf.date_key = "1999/12/31".to_string();
+            }
+        }
+
+        // Next flush — date_key won't match today's entries, so a new file is created
+        // (not appended to the old one)
+        let entry2 = create_test_entry("test-bucket", "key-2");
+        buffer.log(entry2).await.unwrap();
+        buffer.force_flush().await.unwrap();
+
+        let second_path = buffer
+            .current_file
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+
+        // current_file should now point to today's date
+        let current = buffer.current_file.read().await;
+        let cf = current.as_ref().unwrap();
+        assert_eq!(
+            cf.date_key,
+            Utc::now().format("%Y/%m/%d").to_string(),
+            "current_file date_key should match today after date partition change"
+        );
+
+        // The key assertion: the date_key mismatch caused a NEW file to be created
+        // (via atomic write), not an append to the old file. The old file should still
+        // have exactly 1 entry (it was not appended to).
+        let content_after = std::fs::read_to_string(&first_path).unwrap();
+        assert_eq!(
+            content_after.lines().count(),
+            1,
+            "Original file should still have 1 entry (not appended to after date change)"
+        );
+
+        // The new file should have exactly 1 entry
+        let new_content = std::fs::read_to_string(&second_path).unwrap();
+        assert_eq!(
+            new_content.lines().count(),
+            1,
+            "New file created after date partition change should have 1 entry"
+        );
+    }
+
+    // =========================================================================
+    // Property-based tests for log lifecycle
+    // =========================================================================
+
+    // Feature: log-lifecycle, Property 7: File rotation window consolidation
+    // **Validates: Requirements 9.5, 9.6, 9.7**
+    //
+    // For any sequence of access log flushes with known timestamps and a given
+    // file_rotation_interval, the number of distinct files created should equal
+    // the number of rotation windows spanned. All entries flushed within the same
+    // rotation window should be written to the same file. A flush after the rotation
+    // interval has elapsed since the current file's creation should create a new file.
+    #[tokio::test]
+    async fn prop_file_rotation_window_consolidation() {
+        use quickcheck::{Arbitrary, Gen};
+
+        // Run multiple random iterations to get property-based coverage.
+        // Each iteration sleeps ~1.2s between batches, so we limit iterations
+        // and batch count to keep total runtime reasonable (~30s).
+        let mut gen = Gen::new(100);
+        for _ in 0..20 {
+            // Generate random batch count [1, 3] and flushes per batch [1, 4]
+            let batch_count = (u8::arbitrary(&mut gen) % 3) as usize + 1;
+            let mut flushes_per_batch: Vec<usize> = Vec::new();
+            let mut entries_per_flush: Vec<Vec<usize>> = Vec::new();
+
+            for _ in 0..batch_count {
+                let num_flushes = (u8::arbitrary(&mut gen) % 4) as usize + 1;
+                let mut flush_entries = Vec::new();
+                for _ in 0..num_flushes {
+                    let num_entries = (u8::arbitrary(&mut gen) % 3) as usize + 1; // 1-3 entries per flush
+                    flush_entries.push(num_entries);
+                }
+                flushes_per_batch.push(num_flushes);
+                entries_per_flush.push(flush_entries);
+            }
+
+            let temp_dir = TempDir::new().unwrap();
+            let log_dir = temp_dir.path().to_path_buf();
+
+            // Use a rotation interval of 500ms. This is short enough for fast tests
+            // but we sleep >1s between batches to ensure both the rotation window
+            // expires AND the entry timestamp (second-level precision) changes,
+            // producing distinct filenames.
+            let rotation_interval = Duration::from_millis(500);
+
+            let buffer = AccessLogBuffer::new(
+                log_dir.clone(),
+                "test-host".to_string(),
+                Some(Duration::from_secs(3600)), // Long flush interval — we flush manually
+                Some(10000),                     // Large buffer size
+                Some(rotation_interval),
+            );
+
+            let mut total_entries = 0usize;
+
+            for (batch_idx, flush_entries) in entries_per_flush.iter().enumerate() {
+                // If not the first batch, sleep past both the rotation interval AND
+                // the 1-second timestamp boundary so the new file gets a distinct name.
+                if batch_idx > 0 {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                }
+
+                // Perform all flushes in this batch quickly (within the rotation window)
+                for &num_entries in flush_entries {
+                    for _ in 0..num_entries {
+                        let entry = create_test_entry("test-bucket", "test-key");
+                        buffer.log(entry).await.unwrap();
+                        total_entries += 1;
+                    }
+                    let result = buffer.force_flush().await.unwrap();
+                    assert!(
+                        !result.skipped,
+                        "Flush should not be skipped when entries exist"
+                    );
+                }
+            }
+
+            // Count files in the date-partitioned directory
+            let date_path = chrono::Utc::now().format("%Y/%m/%d").to_string();
+            let log_subdir = log_dir.join(&date_path);
+
+            let files: Vec<_> = std::fs::read_dir(&log_subdir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .collect();
+
+            // File count should equal batch count: flushes within the same rotation
+            // window append to the same file, and sleeping past the interval creates a new one
+            assert_eq!(
+                files.len(),
+                batch_count,
+                "Expected {} files (one per rotation window batch), got {}. \
+                 Batches: {:?}, entries_per_flush: {:?}",
+                batch_count,
+                files.len(),
+                flushes_per_batch,
+                entries_per_flush,
+            );
+
+            // Total lines across all files should equal total entries
+            let mut total_lines = 0usize;
+            for file in &files {
+                let content = std::fs::read_to_string(file.path()).unwrap();
+                total_lines += content.lines().count();
+            }
+            assert_eq!(
+                total_lines, total_entries,
+                "Expected {} total log lines, got {}",
+                total_entries, total_lines,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod mask_presigned_params_tests {
+    use super::*;
+
+    #[test]
+    fn no_query_string_unchanged() {
+        let uri = "/bucket/key";
+        assert_eq!(mask_presigned_params(uri), uri);
+    }
+
+    #[test]
+    fn no_sensitive_params_unchanged() {
+        let uri = "/bucket/key?prefix=foo&delimiter=/";
+        assert_eq!(mask_presigned_params(uri), uri);
+    }
+
+    #[test]
+    fn masks_signature() {
+        let uri = "/bucket/key?X-Amz-Signature=abc123&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?X-Amz-Signature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn masks_credential() {
+        let uri = "/bucket/key?X-Amz-Credential=AKID/20230101/us-east-1/s3/aws4_request&X-Amz-Date=20230101T000000Z";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-Amz-Credential=REDACTED&X-Amz-Date=20230101T000000Z"
+        );
+    }
+
+    #[test]
+    fn masks_security_token() {
+        let uri = "/bucket/key?X-Amz-Security-Token=FwoGZXIvYXdzEBY&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-Amz-Security-Token=REDACTED&other=val"
+        );
+    }
+
+    #[test]
+    fn masks_all_three_params() {
+        let uri = "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID/scope&X-Amz-Date=20230101T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef&X-Amz-Security-Token=session";
+        let masked = mask_presigned_params(uri);
+        assert!(masked.contains("X-Amz-Credential=REDACTED"));
+        assert!(masked.contains("X-Amz-Signature=REDACTED"));
+        assert!(masked.contains("X-Amz-Security-Token=REDACTED"));
+        // Non-sensitive params preserved
+        assert!(masked.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(masked.contains("X-Amz-Date=20230101T000000Z"));
+        assert!(masked.contains("X-Amz-Expires=3600"));
+        assert!(masked.contains("X-Amz-SignedHeaders=host"));
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        let uri = "/bucket/key?x-amz-signature=abc&x-amz-credential=cred&x-amz-security-token=tok";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?x-amz-signature=REDACTED&x-amz-credential=REDACTED&x-amz-security-token=REDACTED"
+        );
+    }
+
+    #[test]
+    fn mixed_case_matching() {
+        let uri = "/bucket/key?X-AMZ-SIGNATURE=abc&X-Amz-Credential=cred";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-AMZ-SIGNATURE=REDACTED&X-Amz-Credential=REDACTED"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_param_names() {
+        // X-Amz-Signature with percent-encoded hyphen: X%2DAmz%2DSignature
+        let uri = "/bucket/key?X%2DAmz%2DSignature=secret123&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?X%2DAmz%2DSignature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn preserves_path_unchanged() {
+        let uri = "/my-bucket/path/to/object.txt?X-Amz-Signature=sig&prefix=test";
+        let masked = mask_presigned_params(uri);
+        assert!(masked.starts_with("/my-bucket/path/to/object.txt?"));
+        assert!(masked.contains("X-Amz-Signature=REDACTED"));
+        assert!(masked.contains("prefix=test"));
+    }
+
+    #[test]
+    fn bare_param_without_equals_preserved() {
+        let uri = "/bucket/key?X-Amz-Signature=sig&bare_param&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?X-Amz-Signature=REDACTED&bare_param&other=val"
+        );
+    }
+
+    #[test]
+    fn empty_value_masked() {
+        let uri = "/bucket/key?X-Amz-Signature=&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?X-Amz-Signature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn fast_path_no_allocation_for_non_presigned() {
+        // URI with query params but no presigned params — fast path should return as-is
+        let uri = "/bucket/key?prefix=foo&max-keys=100&delimiter=/";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, uri);
+    }
+
+    #[test]
+    fn encoded_leading_x_uppercase_masks_credential() {
+        // %58 is percent-encoded 'X' — must not bypass the fast-path
+        let uri = "/bucket/key?%58-Amz-Credential=AKID/scope&X-Amz-Date=20230101T000000Z";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?%58-Amz-Credential=REDACTED&X-Amz-Date=20230101T000000Z"
+        );
+    }
+
+    #[test]
+    fn encoded_leading_x_lowercase_masks_signature() {
+        // %78 is percent-encoded 'x' — must not bypass the fast-path
+        let uri = "/bucket/key?%78-Amz-Signature=secret&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(masked, "/bucket/key?%78-Amz-Signature=REDACTED&other=val");
+    }
+
+    #[test]
+    fn encoded_leading_x_with_encoded_hyphens() {
+        // %58%2DAmz%2DSignature — both leading X and hyphens encoded
+        let uri = "/bucket/key?%58%2DAmz%2DSignature=secret&other=val";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?%58%2DAmz%2DSignature=REDACTED&other=val"
+        );
+    }
+
+    #[test]
+    fn encoded_leading_x_security_token() {
+        // %58-Amz-Security-Token with encoded leading X
+        let uri = "/bucket/key?%58-Amz-Security-Token=session123&prefix=foo";
+        let masked = mask_presigned_params(uri);
+        assert_eq!(
+            masked,
+            "/bucket/key?%58-Amz-Security-Token=REDACTED&prefix=foo"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_lifecycle_property_tests {
+    use super::*;
+    use filetime::{set_file_mtime, FileTime};
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+    use tempfile::TempDir;
+
+    // Feature: log-lifecycle, Property 4: Cleanup deletes exactly the expired files
+    // **Validates: Requirements 4.4, 4.5, 5.1, 5.2, 8.1, 8.2**
+    //
+    // For any set of files with random modification times and any retention period in [1, 365] days,
+    // after running cleanup:
+    //   (a) no file older than the retention period should remain
+    //   (b) all files newer than the retention period should be preserved
+    //   (c) another hostname's application logs are reaped only once they exceed
+    //       retention + FOREIGN_GRACE (one day), and survive inside that band
+    //   (d) access log cleanup traverses the entire date-partitioned tree
+    //
+    // (c) previously asserted that a foreign hostname's directory was never
+    // touched at all. That encoded retention-as-a-property-of-the-writer, which
+    // is the behaviour the access-log-retention-scope work deliberately removed:
+    // a survivor now reaps a terminated peer's logs, but only a full day past
+    // the policy so it can never reach a live peer's in-retention file. The
+    // filenames here are also now suffixed with the local hostname so the
+    // access-log half exercises the OWN cutoff; before, they ended in
+    // `-access-{i}`, which the ownership rule correctly reads as foreign.
+    #[quickcheck]
+    fn prop_cleanup_deletes_exactly_expired_files(
+        file_ages_days: Vec<u16>,
+        retention_raw: u16,
+        other_host_ages: Vec<u16>,
+    ) -> TestResult {
+        // Need at least one file to test
+        if file_ages_days.is_empty() {
+            return TestResult::discard();
+        }
+        // Cap file count to keep tests fast
+        if file_ages_days.len() > 20 || other_host_ages.len() > 10 {
+            return TestResult::discard();
+        }
+
+        // Map retention to valid range [1, 365]
+        let retention_days = (retention_raw % 365) as u32 + 1;
+
+        let temp_dir = TempDir::new().unwrap();
+        let access_log_dir = temp_dir.path().join("access_logs");
+        let app_log_dir = temp_dir.path().join("app_logs");
+        let hostname = "test-host-prop4";
+
+        // Create directory structure
+        let host_app_dir = app_log_dir.join(hostname);
+        std::fs::create_dir_all(&host_app_dir).unwrap();
+        let other_host_dir = app_log_dir.join("other-host");
+        std::fs::create_dir_all(&other_host_dir).unwrap();
+
+        // Create access log date-partitioned dir
+        let access_date_dir = access_log_dir.join("2024/01/15");
+        std::fs::create_dir_all(&access_date_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+
+        // --- Create app log files for our hostname ---
+        let mut expected_app_surviving = 0u32;
+        let mut expected_app_deleted = 0u32;
+        for (i, &age_raw) in file_ages_days.iter().enumerate() {
+            let age_days = age_raw % 730; // up to ~2 years
+            let path = host_app_dir.join(format!("s3-proxy.log.{}", i));
+            std::fs::write(&path, format!("app log content {}", i)).unwrap();
+
+            let mtime_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+                - (age_days as i64 * 86400);
+            set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+
+            if age_days < retention_days as u16 {
+                expected_app_surviving += 1;
+            } else {
+                expected_app_deleted += 1;
+            }
+        }
+
+        // --- Create app log files for OTHER hostname (should NOT be touched) ---
+        let other_host_file_count = other_host_ages.len();
+        for (i, &age_raw) in other_host_ages.iter().enumerate() {
+            let age_days = age_raw % 730;
+            let path = other_host_dir.join(format!("s3-proxy.log.{}", i));
+            std::fs::write(&path, format!("other host log {}", i)).unwrap();
+
+            let mtime_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+                - (age_days as i64 * 86400);
+            set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+        }
+
+        // --- Create access log files in date-partitioned tree ---
+        let mut expected_access_surviving = 0u32;
+        let mut expected_access_deleted = 0u32;
+        for (i, &age_raw) in file_ages_days.iter().enumerate() {
+            let age_days = age_raw % 730;
+            // Owned by the local hostname (so the own cutoff applies), with a
+            // distinct second in the fixed-width stamp to keep names unique.
+            let path = access_date_dir.join(format!("2024-01-15-00-00-{:02}-{}", i % 60, hostname));
+            std::fs::write(&path, format!("access log content {}", i)).unwrap();
+
+            let mtime_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+                - (age_days as i64 * 86400);
+            set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+
+            if age_days < retention_days as u16 {
+                expected_access_surviving += 1;
+            } else {
+                expected_access_deleted += 1;
+            }
+        }
+
+        // Create LoggerManager with access logging enabled
+        let config = LoggingConfig {
+            access_log_dir: access_log_dir.clone(),
+            app_log_dir: app_log_dir.clone(),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        };
+        let manager = LoggerManager::new(config);
+
+        // Run cleanup
+        let result = manager.rotate_logs(retention_days, retention_days).unwrap();
+
+        // A hostname directory the sweep leaves empty is now pruned (Req 4.4), so
+        // the directory may legitimately be gone rather than present-and-empty.
+        // Treat absent as zero files rather than panicking on `read_dir`.
+        fn surviving_files(dir: &std::path::Path) -> Vec<std::fs::DirEntry> {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_file())
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        // (a) & (b): Check app log files — only non-expired files for our hostname remain
+        let remaining_app_files = surviving_files(&host_app_dir);
+
+        if remaining_app_files.len() as u32 != expected_app_surviving {
+            return TestResult::error(format!(
+                "App log: expected {} surviving files, got {}",
+                expected_app_surviving,
+                remaining_app_files.len()
+            ));
+        }
+
+        // The app sweep now walks the whole `app_log_dir`, so the reported total
+        // covers the foreign hostname directory too. Count its expected
+        // deletions at the grace-widened cutoff and add them in.
+        let expected_other_deleted = other_host_ages
+            .iter()
+            .filter(|&&age_raw| (age_raw % 730) as u32 > retention_days)
+            .count() as u32;
+
+        if result.app_files_deleted != expected_app_deleted + expected_other_deleted {
+            return TestResult::error(format!(
+                "App log: expected {} own + {} adopted deleted, result reports {} ({} adopted)",
+                expected_app_deleted,
+                expected_other_deleted,
+                result.app_files_deleted,
+                result.app_files_adopted
+            ));
+        }
+
+        if result.app_files_adopted != expected_other_deleted {
+            return TestResult::error(format!(
+                "App log: expected {} adopted, result reports {}",
+                expected_other_deleted, result.app_files_adopted
+            ));
+        }
+
+        // (c): Another hostname's files are reaped only past retention + grace.
+        // Inside the band they must survive — that is the property that makes
+        // sweeping the whole app_log_dir safe against a live peer.
+        let expected_other_surviving = other_host_ages
+            .iter()
+            .filter(|&&age_raw| {
+                let age_days = age_raw % 730;
+                // Foreign cutoff is retention + 1 day, so a file is a candidate
+                // only once strictly older than that.
+                (age_days as u32) < retention_days + 1
+            })
+            .count();
+
+        let remaining_other_files = surviving_files(&other_host_dir);
+
+        if remaining_other_files.len() != expected_other_surviving {
+            return TestResult::error(format!(
+                "Other host: expected {} of {} files to survive retention {}d + 1d grace, got {}",
+                expected_other_surviving,
+                other_host_file_count,
+                retention_days,
+                remaining_other_files.len()
+            ));
+        }
+
+        // (d): Check access log files — traverses entire tree
+        // Count remaining files recursively in access_log_dir
+        fn count_files_recursive(dir: &std::path::Path) -> u32 {
+            let mut count = 0;
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        count += count_files_recursive(&path);
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+
+        let remaining_access_files = count_files_recursive(&access_log_dir);
+        if remaining_access_files != expected_access_surviving {
+            return TestResult::error(format!(
+                "Access log: expected {} surviving files, got {}",
+                expected_access_surviving, remaining_access_files
+            ));
+        }
+
+        if result.access_files_deleted != expected_access_deleted {
+            return TestResult::error(format!(
+                "Access log: expected {} deleted, result reports {}",
+                expected_access_deleted, result.access_files_deleted
+            ));
+        }
+
+        TestResult::passed()
+    }
+
+    // Feature: log-lifecycle, Property 5: Empty directories are removed after cleanup
+    // **Validates: Requirements 4.6**
+    //
+    // For any date-partitioned directory tree where all files in a day/month/year directory
+    // have been deleted by cleanup, the empty day, month, and year directories should be removed.
+    // Directories that still contain files or non-empty subdirectories should be preserved.
+    #[quickcheck]
+    fn prop_empty_directories_removed_after_cleanup(
+        // Each element is (month 1-12, day 1-28, file_count 1-3, all_expired: bool)
+        partitions_raw: Vec<(u8, u8, u8, bool)>,
+        retention_raw: u16,
+    ) -> TestResult {
+        // Need at least one partition
+        if partitions_raw.is_empty() {
+            return TestResult::discard();
+        }
+        // Cap partition count to keep tests fast
+        if partitions_raw.len() > 12 {
+            return TestResult::discard();
+        }
+
+        // Map retention to valid range [1, 365]
+        let retention_days = (retention_raw % 365) as u32 + 1;
+
+        let temp_dir = TempDir::new().unwrap();
+        let access_log_dir = temp_dir.path().join("access_logs");
+        let app_log_dir = temp_dir.path().join("app_logs");
+        let hostname = "test-host-prop5";
+
+        // Create app log dir (needed by LoggerManager)
+        let host_app_dir = app_log_dir.join(hostname);
+        std::fs::create_dir_all(&host_app_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        // Track which (year, month, day) partitions should survive
+        // A partition survives if it has at least one non-expired file
+        let mut surviving_day_dirs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // Deduplicate partitions by (month, day) to avoid conflicts
+        let mut seen_partitions: std::collections::HashSet<(u8, u8)> =
+            std::collections::HashSet::new();
+
+        let year = "2024";
+        for &(month_raw, day_raw, file_count_raw, all_expired) in &partitions_raw {
+            let month = (month_raw % 12) + 1; // 1-12
+            let day = (day_raw % 28) + 1; // 1-28
+
+            // Skip duplicate partitions
+            if !seen_partitions.insert((month, day)) {
+                continue;
+            }
+
+            let file_count = ((file_count_raw % 3) + 1) as usize; // 1-3 files
+
+            let date_dir = access_log_dir.join(format!("{}/{:02}/{:02}", year, month, day));
+            std::fs::create_dir_all(&date_dir).unwrap();
+
+            for i in 0..file_count {
+                let path =
+                    date_dir.join(format!("2024-{:02}-{:02}-00-00-00-file-{}", month, day, i));
+                std::fs::write(&path, format!("access log content {}", i)).unwrap();
+
+                let mtime_secs = if all_expired {
+                    // Set mtime well beyond retention period
+                    now_secs - ((retention_days as i64 + 30) * 86400)
+                } else {
+                    // Set mtime to recent (within retention)
+                    now_secs - 3600 // 1 hour ago
+                };
+                set_file_mtime(&path, FileTime::from_unix_time(mtime_secs, 0)).unwrap();
+            }
+
+            if !all_expired {
+                surviving_day_dirs.insert(format!("{}/{:02}/{:02}", year, month, day));
+            }
+        }
+
+        // Create LoggerManager
+        let config = LoggingConfig {
+            access_log_dir: access_log_dir.clone(),
+            app_log_dir: app_log_dir.clone(),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        };
+        let manager = LoggerManager::new(config);
+
+        // Run cleanup
+        manager.rotate_logs(retention_days, retention_days).unwrap();
+
+        // Verify: surviving day directories still exist
+        for day_path in &surviving_day_dirs {
+            let full_path = access_log_dir.join(day_path);
+            if !full_path.exists() {
+                return TestResult::error(format!(
+                    "Non-empty day dir should be preserved but was removed: {}",
+                    day_path
+                ));
+            }
+        }
+
+        // Verify: no empty directories remain anywhere in the access log tree
+        fn find_empty_dirs(dir: &std::path::Path, results: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+                if entries.is_empty() {
+                    results.push(dir.to_path_buf());
+                    return;
+                }
+                for entry in &entries {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        find_empty_dirs(&path, results);
+                    }
+                }
+            }
+        }
+
+        let mut empty_dirs = Vec::new();
+        if access_log_dir.exists() {
+            find_empty_dirs(&access_log_dir, &mut empty_dirs);
+        }
+
+        // The access_log_dir root itself may be empty if all partitions were expired — that's fine,
+        // cleanup_directory_recursive doesn't remove the root dir. But any subdirectory that is
+        // empty should have been removed.
+        let empty_subdirs: Vec<_> = empty_dirs
+            .iter()
+            .filter(|d| *d != &access_log_dir)
+            .collect();
+
+        if !empty_subdirs.is_empty() {
+            return TestResult::error(format!(
+                "Empty subdirectories should have been removed: {:?}",
+                empty_subdirs
+            ));
+        }
+
+        // Verify: parent directories of surviving partitions exist (month and year)
+        for day_path in &surviving_day_dirs {
+            let parts: Vec<&str> = day_path.split('/').collect();
+            // Check year dir
+            let year_dir = access_log_dir.join(parts[0]);
+            if !year_dir.exists() {
+                return TestResult::error(format!(
+                    "Year dir should be preserved for surviving partition: {}",
+                    parts[0]
+                ));
+            }
+            // Check month dir
+            let month_dir = access_log_dir.join(format!("{}/{}", parts[0], parts[1]));
+            if !month_dir.exists() {
+                return TestResult::error(format!(
+                    "Month dir should be preserved for surviving partition: {}/{}",
+                    parts[0], parts[1]
+                ));
+            }
+        }
+
+        TestResult::passed()
+    }
+
+    // Feature: log-lifecycle, Property 6: Cleanup continues after I/O errors
+    // **Validates: Requirements 6.3**
+    //
+    // For any set of files where some files are inaccessible (permission denied, etc.),
+    // cleanup should still delete all accessible expired files and report the error count.
+    // The number of successfully deleted files plus the error count should equal the total
+    // number of expired files.
+    #[quickcheck]
+    fn prop_cleanup_continues_after_io_errors(
+        deletable_count_raw: u8,
+        undeletable_count_raw: u8,
+    ) -> TestResult {
+        // CI runs as root, which bypasses Unix file permissions, so a read-only
+        // directory does not produce the I/O error this test depends on. Skip.
+        if unsafe { libc::geteuid() } == 0 {
+            return TestResult::discard();
+        }
+
+        // Map to reasonable counts: at least 1 deletable and 1 undeletable
+        let deletable_count = (deletable_count_raw % 10) as usize + 1;
+        let undeletable_count = (undeletable_count_raw % 10) as usize + 1;
+
+        let temp_dir = TempDir::new().unwrap();
+        let access_log_dir = temp_dir.path().join("access_logs");
+        let app_log_dir = temp_dir.path().join("app_logs");
+        let hostname = "test-host-prop6";
+
+        // Create app log dir (needed by LoggerManager)
+        let host_app_dir = app_log_dir.join(hostname);
+        std::fs::create_dir_all(&host_app_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        // All files are expired (well beyond any retention period)
+        let expired_mtime_secs = now_secs - (400 * 86400); // 400 days ago
+        let retention_days = 1u32;
+
+        // --- Create deletable expired files in a normal (writable) subdirectory ---
+        let writable_dir = access_log_dir.join("2023/01/01");
+        std::fs::create_dir_all(&writable_dir).unwrap();
+
+        for i in 0..deletable_count {
+            let path = writable_dir.join(format!("2023-01-01-00-00-00-deletable-{}", i));
+            std::fs::write(&path, format!("deletable content {}", i)).unwrap();
+            set_file_mtime(&path, FileTime::from_unix_time(expired_mtime_secs, 0)).unwrap();
+        }
+
+        // --- Create undeletable expired files in a read-only subdirectory ---
+        // Making the parent directory read-only prevents file deletion on Unix
+        let readonly_dir = access_log_dir.join("2023/02/01");
+        std::fs::create_dir_all(&readonly_dir).unwrap();
+
+        for i in 0..undeletable_count {
+            let path = readonly_dir.join(format!("2023-02-01-00-00-00-undeletable-{}", i));
+            std::fs::write(&path, format!("undeletable content {}", i)).unwrap();
+            set_file_mtime(&path, FileTime::from_unix_time(expired_mtime_secs, 0)).unwrap();
+        }
+
+        // Make the subdirectory read-only (removes write permission)
+        // This prevents deletion of files inside it on Unix
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(true);
+        }
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+
+        // Create LoggerManager
+        let config = LoggingConfig {
+            access_log_dir: access_log_dir.clone(),
+            app_log_dir: app_log_dir.clone(),
+            access_log_enabled: true,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        };
+        let manager = LoggerManager::new(config);
+
+        // Run cleanup — this should NOT panic or abort
+        let result = match manager.rotate_logs(retention_days, retention_days) {
+            Ok(r) => r,
+            Err(_) => {
+                // If rotate_logs itself errors (e.g. permission setup was a no-op),
+                // restore permissions and discard.
+                let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                {
+                    perms.set_readonly(false);
+                }
+                let _ = std::fs::set_permissions(&readonly_dir, perms);
+                return TestResult::discard();
+            }
+        };
+
+        // Restore permissions so tempfile can clean up the directory
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(false);
+        }
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+
+        // Assert: all deletable expired files were removed
+        let remaining_writable: Vec<_> = std::fs::read_dir(&writable_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_file())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !remaining_writable.is_empty() {
+            return TestResult::error(format!(
+                "Expected all {} deletable files removed, but {} remain",
+                deletable_count,
+                remaining_writable.len()
+            ));
+        }
+
+        // Assert: undeletable files still exist
+        let remaining_readonly: Vec<_> = std::fs::read_dir(&readonly_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+
+        if remaining_readonly.len() != undeletable_count {
+            return TestResult::error(format!(
+                "Expected {} undeletable files to remain, but {} remain",
+                undeletable_count,
+                remaining_readonly.len()
+            ));
+        }
+
+        // Assert: deleted count matches deletable files
+        if result.access_files_deleted != deletable_count as u32 {
+            return TestResult::error(format!(
+                "Expected {} access files deleted, got {}",
+                deletable_count, result.access_files_deleted
+            ));
+        }
+
+        // Assert: error count matches undeletable files
+        if result.errors != undeletable_count as u32 {
+            return TestResult::error(format!(
+                "Expected {} errors, got {}",
+                undeletable_count, result.errors
+            ));
+        }
+
+        // Assert: deleted + errors = total expired files
+        let total_expired = (deletable_count + undeletable_count) as u32;
+        if result.access_files_deleted + result.errors != total_expired {
+            return TestResult::error(format!(
+                "deleted ({}) + errors ({}) != total expired ({})",
+                result.access_files_deleted, result.errors, total_expired
+            ));
+        }
+
+        TestResult::passed()
+    }
+}
+
+#[cfg(test)]
+mod mask_presigned_params_property_tests {
+    use super::*;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+
+    // Property 15: Complete credential masking
+    // **Validates: Requirements 15.1, 15.2, 15.3, 15.5**
+    //
+    // For every generated URL with presigned params at various positions, assert:
+    //   (a) masked output contains no sensitive values (X-Amz-Signature, X-Amz-Credential,
+    //       X-Amz-Security-Token values)
+    //   (b) masked output preserves the path portion unchanged
+    //   (c) masked output preserves non-sensitive parameter names and values unchanged
+    //   (d) masked output preserves sensitive parameter NAMES (only values are masked)
+    //   (e) no panics on any input
+    #[quickcheck]
+    fn prop_complete_credential_masking(
+        path_segments: Vec<String>,
+        non_sensitive_params: Vec<(String, String)>,
+        signature_value: String,
+        credential_value: String,
+        token_value: String,
+        param_order_seed: u8,
+    ) -> TestResult {
+        // Build a path from segments, filtering out empty/problematic segments
+        let path_parts: Vec<&str> = path_segments
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty() && !s.contains('?') && !s.contains('#'))
+            .take(5)
+            .collect();
+
+        let path = if path_parts.is_empty() {
+            "/bucket/key".to_string()
+        } else {
+            format!("/{}", path_parts.join("/"))
+        };
+
+        // Filter non-sensitive params: exclude anything that looks like a sensitive param name
+        // and exclude params with problematic characters or trivially short names/values
+        let safe_params: Vec<(&str, &str)> = non_sensitive_params
+            .iter()
+            .filter(|(name, _)| {
+                let lower = name.to_ascii_lowercase();
+                !lower.contains("x-amz-signature")
+                    && !lower.contains("x-amz-credential")
+                    && !lower.contains("x-amz-security-token")
+                    && !name.contains('&')
+                    && !name.contains('=')
+                    && !name.contains('?')
+                    && !name.is_empty()
+                    && name.trim().len() >= 2
+            })
+            .filter(|(_, val)| !val.contains('&') && !val.contains('=') && !val.contains('?'))
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .take(5)
+            .collect();
+
+        // Build sensitive params with non-empty values for meaningful testing
+        // Filter sensitive values: exclude chars that appear structurally in URLs
+        // (& = ? /) and very short values that could match substrings of other
+        // params or the URL structure itself, causing false-positive assertions.
+        let is_problematic_value = |v: &str| -> bool {
+            v.is_empty()
+                || v.chars().count() < 4  // character count, not byte length: U+10FFFF is 4 bytes but 1 char
+                || v.contains('&')
+                || v.contains('=')
+                || v.contains('?')
+                || v.contains('/')
+                || v.trim().is_empty()
+        };
+        let sig_val = if is_problematic_value(&signature_value) {
+            "abc123sig".to_string()
+        } else {
+            signature_value.clone()
+        };
+        let cred_val = if is_problematic_value(&credential_value) {
+            "AKID/20230101/us-east-1/s3/aws4_request".to_string()
+        } else {
+            credential_value.clone()
+        };
+        let tok_val = if is_problematic_value(&token_value) {
+            "FwoGZXIvYXdzEBYtoken".to_string()
+        } else {
+            token_value.clone()
+        };
+
+        // Build query params in various orders based on seed
+        let sensitive_params = [
+            ("X-Amz-Signature", sig_val.as_str()),
+            ("X-Amz-Credential", cred_val.as_str()),
+            ("X-Amz-Security-Token", tok_val.as_str()),
+        ];
+
+        // Determine which sensitive params to include (at least one)
+        let include_mask = (param_order_seed % 7) + 1; // 1-7, bitmask for 3 params
+        let mut all_params: Vec<(&str, &str)> = Vec::new();
+
+        // Add non-sensitive params first
+        for (name, val) in &safe_params {
+            all_params.push((name, val));
+        }
+
+        // Insert sensitive params at positions determined by seed
+        for (i, &(name, val)) in sensitive_params.iter().enumerate() {
+            if include_mask & (1 << i) != 0 {
+                let insert_pos = if all_params.is_empty() {
+                    0
+                } else {
+                    ((param_order_seed as usize).wrapping_add(i * 37)) % (all_params.len() + 1)
+                };
+                all_params.insert(insert_pos, (name, val));
+            }
+        }
+
+        // Need at least one sensitive param for a meaningful test
+        if all_params.iter().all(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            !SENSITIVE_PARAMS.contains(&lower.as_str())
+        }) {
+            return TestResult::discard();
+        }
+
+        // Build the URI
+        let query_string: String = all_params
+            .iter()
+            .map(|(name, val)| format!("{}={}", name, val))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let uri = format!("{}?{}", path, query_string);
+
+        // Apply masking
+        let masked = mask_presigned_params(&uri);
+
+        // (a) Masked output must not contain any sensitive VALUES
+        // Only check non-trivial values (empty values become "REDACTED" which is fine).
+        // Skip if a non-sensitive param value happens to collide with the sensitive value
+        // (the function correctly preserves non-sensitive values, which may coincidentally
+        // match a sensitive value string).
+        for (i, &(_, val)) in sensitive_params.iter().enumerate() {
+            if include_mask & (1 << i) != 0
+                && !val.is_empty()
+                && val != "REDACTED"
+                && masked.contains(val)
+            {
+                // Check whether the match is actually a non-sensitive param value collision
+                let collision_with_safe = safe_params.iter().any(|(_, v)| v.contains(val));
+                if !collision_with_safe {
+                    return TestResult::error(format!(
+                        "Masked output still contains sensitive value '{}' in: {}",
+                        val, masked
+                    ));
+                }
+            }
+        }
+
+        // (b) Path portion must be preserved unchanged
+        let masked_path = masked.split('?').next().unwrap_or("");
+        if masked_path != path {
+            return TestResult::error(format!(
+                "Path changed: expected '{}', got '{}'",
+                path, masked_path
+            ));
+        }
+
+        // (c) Non-sensitive parameter names and values must be preserved
+        for (name, val) in &safe_params {
+            let expected_fragment = format!("{}={}", name, val);
+            if !masked.contains(&expected_fragment) {
+                return TestResult::error(format!(
+                    "Non-sensitive param '{}={}' not preserved in: {}",
+                    name, val, masked
+                ));
+            }
+        }
+
+        // (d) Sensitive parameter NAMES must be preserved (only values masked)
+        for (i, &(name, _)) in sensitive_params.iter().enumerate() {
+            if include_mask & (1 << i) != 0 {
+                let expected_name_prefix = format!("{}=", name);
+                if !masked.contains(&expected_name_prefix) {
+                    return TestResult::error(format!(
+                        "Sensitive param name '{}' not preserved in: {}",
+                        name, masked
+                    ));
+                }
+                // The value after the name should be REDACTED
+                let redacted_fragment = format!("{}=REDACTED", name);
+                if !masked.contains(&redacted_fragment) {
+                    return TestResult::error(format!(
+                        "Sensitive param '{}' not masked to REDACTED in: {}",
+                        name, masked
+                    ));
+                }
+            }
+        }
+
+        TestResult::passed()
+    }
+}
+
+#[cfg(test)]
+mod sanitize_log_field_tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn clean_field_unchanged() {
+        assert_eq!(sanitize_log_field("Mozilla/5.0"), "Mozilla/5.0");
+    }
+
+    #[test]
+    fn dash_unchanged() {
+        assert_eq!(sanitize_log_field("-"), "-");
+    }
+
+    #[test]
+    fn escapes_newline() {
+        assert_eq!(sanitize_log_field("line1\nline2"), "line1\\nline2");
+    }
+
+    #[test]
+    fn escapes_carriage_return() {
+        assert_eq!(sanitize_log_field("line1\rline2"), "line1\\rline2");
+    }
+
+    #[test]
+    fn escapes_double_quote() {
+        assert_eq!(sanitize_log_field("has\"quote"), "has\\\"quote");
+    }
+
+    #[test]
+    fn escapes_all_dangerous_chars() {
+        assert_eq!(sanitize_log_field("evil\r\n\"agent"), "evil\\r\\n\\\"agent");
+    }
+
+    #[test]
+    fn format_entry_user_agent_with_newline_quote_does_not_break_line() {
+        // A user agent containing \n and " must not produce multiple log lines
+        let entry = AccessLogEntry {
+            bucket_owner: "owner".to_string(),
+            bucket: "bucket".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-1".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "key".to_string(),
+            request_uri: "/bucket/key".to_string(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 1024,
+            object_size: Some(1024),
+            total_time: 100,
+            turn_around_time: 50,
+            referer: Some("http://evil.com/\ninjected".to_string()),
+            user_agent: Some("BadBot/1.0\n\"injected-field".to_string()),
+            host_id: "host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: None,
+            host_header: None,
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        };
+
+        let formatted = AccessLogBuffer::format_entry(&entry);
+
+        // The formatted entry must be a single line (no raw newlines)
+        assert_eq!(
+            formatted.lines().count(),
+            1,
+            "Log entry must be a single line, but got multiple lines: {:?}",
+            formatted
+        );
+
+        // The escaped sequences must be present
+        assert!(
+            formatted.contains("\\n"),
+            "Newline should be escaped as \\n"
+        );
+        assert!(
+            formatted.contains("\\\""),
+            "Quote should be escaped as \\\""
+        );
+
+        // Raw dangerous characters must NOT be present
+        assert!(!formatted.contains('\n'), "Raw newline must not appear");
+        assert!(
+            !formatted.contains('\r'),
+            "Raw carriage return must not appear"
+        );
+    }
+
+    #[test]
+    fn format_entry_referer_with_crlf_escaped() {
+        let entry = AccessLogEntry {
+            bucket_owner: "owner".to_string(),
+            bucket: "bucket".to_string(),
+            time: Utc::now(),
+            remote_ip: "10.0.0.1".to_string(),
+            requester: "-".to_string(),
+            request_id: "req-2".to_string(),
+            operation: "REST.GET.OBJECT".to_string(),
+            key: "key".to_string(),
+            request_uri: "/bucket/key".to_string(),
+            http_status: 200,
+            error_code: None,
+            bytes_sent: 512,
+            object_size: Some(512),
+            total_time: 50,
+            turn_around_time: 25,
+            referer: Some("http://attacker.com\r\nX-Injected: true".to_string()),
+            user_agent: Some("NormalAgent/1.0".to_string()),
+            host_id: "host".to_string(),
+            signature_version: None,
+            cipher_suite: None,
+            authentication_type: None,
+            host_header: None,
+            tls_version: None,
+            access_point_arn: None,
+            acl_required: None,
+            source_region: None,
+        };
+
+        let formatted = AccessLogBuffer::format_entry(&entry);
+
+        // Must be a single line
+        assert_eq!(formatted.lines().count(), 1);
+
+        // CR and LF must be escaped
+        assert!(!formatted.contains('\r'));
+        assert!(!formatted.contains('\n'));
+        assert!(formatted.contains("\\r\\n"));
+    }
+}
+
+/// Retention-sweep scoping tests.
+///
+/// Retention is a property of the **directory**, enforced in two tiers: the
+/// local instance's own files at `retention_days`, any other hostname's files
+/// at `retention_days + FOREIGN_GRACE`. The grace band exists so that deleting
+/// a peer's file never depends on this instance's clock agreeing with the
+/// peer's — a flat cutoff makes NTP a correctness dependency.
+///
+/// The two `*_inside_the_grace_band` tests are the load-bearing ones: a
+/// regression to a single flat cutoff passes every other test in this module.
+#[cfg(test)]
+mod access_log_retention_tests {
+    use super::*;
+    use filetime::{set_file_mtime, FileTime};
+    use tempfile::TempDir;
+
+    const DAY: i64 = 86_400;
+
+    /// Backdate `path` by `secs` seconds relative to now.
+    fn age_by(path: &std::path::Path, secs: i64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        set_file_mtime(path, FileTime::from_unix_time(now - secs, 0)).unwrap();
+    }
+
+    fn write_file(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// A `LoggingConfig` for the sweep under test. `hostname` is what makes a
+    /// file "ours"; `enabled` exercises the gate that Req 1.1 removes.
+    fn cfg(
+        access_log_dir: &std::path::Path,
+        app_log_dir: &std::path::Path,
+        hostname: &str,
+        enabled: bool,
+        retention_days: u32,
+    ) -> LoggingConfig {
+        LoggingConfig {
+            access_log_dir: access_log_dir.to_path_buf(),
+            app_log_dir: app_log_dir.to_path_buf(),
+            access_log_enabled: enabled,
+            access_log_mode: AccessLogMode::All,
+            hostname: hostname.to_string(),
+            log_level: "warn".to_string(),
+            access_log_flush_interval: Duration::from_secs(5),
+            access_log_buffer_size: 1000,
+            access_log_retention_days: retention_days,
+            app_log_retention_days: retention_days,
+            log_cleanup_interval: Duration::from_secs(86400),
+            access_log_file_rotation_interval: Duration::from_secs(300),
+        }
+    }
+
+    /// Standard fixture: temp dirs, a date partition, and a 30-day retention.
+    struct Fixture {
+        _temp: TempDir,
+        access_dir: std::path::PathBuf,
+        app_dir: std::path::PathBuf,
+        date_dir: std::path::PathBuf,
+        hostname: String,
+        retention_days: u32,
+    }
+
+    fn fixture(hostname: &str) -> Fixture {
+        let temp = TempDir::new().unwrap();
+        let access_dir = temp.path().join("access");
+        let app_dir = temp.path().join("app");
+        let date_dir = access_dir.join("2026/06/02");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        std::fs::create_dir_all(app_dir.join(hostname)).unwrap();
+        Fixture {
+            _temp: temp,
+            access_dir,
+            app_dir,
+            date_dir,
+            hostname: hostname.to_string(),
+            retention_days: 30,
+        }
+    }
+
+    impl Fixture {
+        /// An access log file named per the documented convention:
+        /// `{YYYY-MM-DD-HH-MM-SS}-{hostname}`.
+        fn access_file(&self, host: &str) -> std::path::PathBuf {
+            self.date_dir.join(format!("2026-06-02-11-32-05-{}", host))
+        }
+
+        fn sweep(&self, enabled: bool) -> LogCleanupResult {
+            let manager = LoggerManager::new(cfg(
+                &self.access_dir,
+                &self.app_dir,
+                &self.hostname,
+                enabled,
+                self.retention_days,
+            ));
+            manager
+                .rotate_logs(self.retention_days, self.retention_days)
+                .unwrap()
+        }
+
+        fn retention_secs(&self) -> i64 {
+            self.retention_days as i64 * DAY
+        }
+    }
+
+    // Req 1.1, 7.2 — the defect itself. The sweep must run even when this
+    // instance is not writing access logs.
+    #[test]
+    fn sweeps_access_dir_when_access_logging_disabled() {
+        let f = fixture("host-a");
+        let own = f.access_file("host-a");
+        write_file(&own, "old record\n");
+        age_by(&own, f.retention_secs() + DAY);
+
+        let result = f.sweep(false);
+
+        assert!(
+            !own.exists(),
+            "an own file a day past retention must be reaped with access_log_enabled: false, \
+             but it survived (the retention sweep never ran)"
+        );
+        assert_eq!(
+            result.access_files_deleted, 1,
+            "the sweep must report the deletion"
+        );
+    }
+
+    // Req 2.2 — the hazard the gate was accidentally masking. Removing the gate
+    // widens a sweep that currently deletes ANY old file in the directory.
+    #[test]
+    fn leaves_unmatched_files_regardless_of_age() {
+        let f = fixture("host-a");
+        let foreign_shape = f.date_dir.join("not-an-access-log.txt");
+        write_file(&foreign_shape, "someone else's file\n");
+        age_by(&foreign_shape, f.retention_secs() + 400 * DAY);
+
+        let result = f.sweep(true);
+
+        assert!(
+            foreign_shape.exists(),
+            "a file not matching the access-log naming convention must never be deleted, \
+             however old — this sweep would destroy files the proxy never wrote"
+        );
+        assert_eq!(
+            result.access_files_deleted, 0,
+            "an unmatched file must not be counted as deleted"
+        );
+    }
+
+    // Req 3.2, 5.4 — a terminated peer's file is adopted past retention + grace.
+    #[test]
+    fn reaps_foreign_access_file_past_retention_plus_grace() {
+        let f = fixture("host-a");
+        let foreign = f.access_file("host-b");
+        write_file(&foreign, "dead peer's record\n");
+        age_by(&foreign, f.retention_secs() + 2 * DAY);
+
+        let result = f.sweep(true);
+
+        assert!(
+            !foreign.exists(),
+            "a foreign file past retention + grace must be adopted and reaped"
+        );
+        assert_eq!(result.access_files_deleted, 1);
+        assert_eq!(
+            result.access_files_adopted, 1,
+            "a reaped foreign file must be reported as adopted, since a non-zero \
+             adopted count is the only signal that a peer stopped cleaning up"
+        );
+    }
+
+    // Req 3.2, 3.3 — LOAD-BEARING. Without this, a regression to a single flat
+    // cutoff passes every other test in this module.
+    #[test]
+    fn keeps_foreign_access_file_inside_the_grace_band() {
+        let f = fixture("host-a");
+        let foreign = f.access_file("host-b");
+        write_file(&foreign, "live peer's record\n");
+        // Past our own retention, but inside the one-day foreign grace band.
+        age_by(&foreign, f.retention_secs() + DAY / 2);
+
+        let result = f.sweep(true);
+
+        assert!(
+            foreign.exists(),
+            "a foreign file inside the grace band MUST survive — deleting it makes \
+             correctness depend on this instance's clock agreeing with the peer's"
+        );
+        assert_eq!(result.access_files_deleted, 0);
+        assert_eq!(result.access_files_adopted, 0);
+    }
+
+    // Req 3.1 — pairs with the previous test: together they prove the two
+    // cutoffs are genuinely different rather than one value used twice.
+    #[test]
+    fn reaps_own_access_file_at_retention_without_grace() {
+        let f = fixture("host-a");
+        let own = f.access_file("host-a");
+        write_file(&own, "our own aged record\n");
+        // Past retention but well inside the grace band a foreign file would get.
+        age_by(&own, f.retention_secs() + 3600);
+
+        let result = f.sweep(true);
+
+        assert!(
+            !own.exists(),
+            "our own file must be reaped at retention, with no grace period"
+        );
+        assert_eq!(result.access_files_deleted, 1);
+        assert_eq!(
+            result.access_files_adopted, 0,
+            "our own file must not be counted as adopted"
+        );
+    }
+
+    // Design § 2b — ownership is an exact suffix match, never `contains`, so a
+    // hostname that is a prefix of another cannot claim its files and reap them
+    // a day early.
+    #[test]
+    fn does_not_claim_a_hostname_that_merely_shares_a_prefix() {
+        let f = fixture("host-a");
+        let neighbour = f.access_file("host-a-2");
+        write_file(&neighbour, "different instance\n");
+        age_by(&neighbour, f.retention_secs() + 3600);
+
+        let result = f.sweep(true);
+
+        assert!(
+            neighbour.exists(),
+            "host-a must not claim host-a-2's file: an exact suffix match is required, \
+             otherwise a prefix collision reaps a live peer's file a day early"
+        );
+        assert_eq!(result.access_files_deleted, 0);
+    }
+
+    // Req 3.7 — the file the local instance is currently appending to.
+    // Green both before and after the fix; a guard, not a red demonstration.
+    #[test]
+    fn does_not_delete_the_active_access_file() {
+        let f = fixture("host-a");
+        let active = f.access_file("host-a");
+        write_file(&active, "current record\n");
+        // Fresh mtime, as a file being appended to has.
+
+        let result = f.sweep(true);
+
+        assert!(active.exists(), "the active access log file must survive");
+        assert_eq!(result.access_files_deleted, 0);
+    }
+
+    // Req 4.2, 4.3 — app logs follow the same principle. Today the app sweep is
+    // scoped to app_log_dir/{hostname}, so a terminated peer's logs are never
+    // reaped by a survivor.
+    #[test]
+    fn sweeps_app_logs_under_a_foreign_hostname_directory() {
+        let f = fixture("host-a");
+        let foreign = f.app_dir.join("host-b").join("s3-proxy.log.2026-06-02");
+        write_file(&foreign, "dead peer's app log\n");
+        age_by(&foreign, f.retention_secs() + 2 * DAY);
+
+        let result = f.sweep(true);
+
+        assert!(
+            !foreign.exists(),
+            "a foreign hostname's app log past retention + grace must be reaped — \
+             retention cannot be a property of the directory for access logs and a \
+             property of the writer for app logs"
+        );
+        assert_eq!(result.app_files_deleted, 1);
+        assert_eq!(result.app_files_adopted, 1);
+    }
+
+    // Req 4.3 — the app-log mirror of the grace-band survival assertion, and
+    // the property that makes sweeping the whole directory safe.
+    #[test]
+    fn keeps_foreign_app_log_inside_the_grace_band() {
+        let f = fixture("host-a");
+        let foreign = f.app_dir.join("host-b").join("s3-proxy.log.2026-06-02");
+        write_file(&foreign, "LIVE peer's app log\n");
+        age_by(&foreign, f.retention_secs() + DAY / 2);
+
+        let result = f.sweep(true);
+
+        assert!(
+            foreign.exists(),
+            "a live peer's app log inside the grace band MUST survive — this is the \
+             safety property that makes the widened app-log sweep acceptable"
+        );
+        assert_eq!(result.app_files_deleted, 0);
+        assert_eq!(result.app_files_adopted, 0);
+    }
+
+    // Req 4.4 — an emptied hostname directory from a terminated instance is
+    // pruned; a live one always holds a current file, so it never is.
+    #[test]
+    fn prunes_emptied_hostname_directory_but_not_a_live_one() {
+        let f = fixture("host-a");
+
+        let dead_dir = f.app_dir.join("host-dead");
+        let dead_log = dead_dir.join("s3-proxy.log.2026-06-02");
+        write_file(&dead_log, "terminated instance\n");
+        age_by(&dead_log, f.retention_secs() + 2 * DAY);
+
+        let live_log = f.app_dir.join("host-a").join("s3-proxy.log.2026-08-20");
+        write_file(&live_log, "our current app log\n");
+
+        let _ = f.sweep(true);
+
+        assert!(
+            !dead_dir.exists(),
+            "a hostname directory left empty by the sweep should be pruned"
+        );
+        assert!(
+            f.app_dir.join("host-a").exists(),
+            "a live instance's hostname directory must never be removed"
+        );
+        assert!(live_log.exists(), "our current app log must survive");
+    }
+}

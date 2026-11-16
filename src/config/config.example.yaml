@@ -1,0 +1,804 @@
+# Hybrid Cache for OBS (S3 兼容协议) Configuration Example
+# This file demonstrates all available configuration options
+
+server:
+  # Server operating mode (default: "standard")
+  # "standard"    — starts HTTP listener on http_port and HTTPS listener on https_port
+  # "proxy_only"  — starts only the HTTP forward proxy on proxy_port; no sudo, DNS
+  #                  changes, or /etc/hosts modifications needed
+  mode: "standard"
+  # Port for the HTTP forward proxy in proxy_only mode (default: 3128)
+  # Ignored in standard mode. Clients set HTTP_PROXY=http://127.0.0.1:<proxy_port>.
+  proxy_port: 3128
+  http_port: 80
+  https_port: 443
+  https_mode: "passthrough"  # TCP passthrough to S3 (no caching on the HTTPS listener)
+  # Maximum concurrent requests (default: 1000). Bounds the whole request,
+  # including its response-body transfer, not just setup — a permit is held
+  # until the body has fully streamed to the client. Each concurrent request
+  # uses approximately 5 MiB of memory on the streaming paths:
+  #   - Cache hit: ~1 MiB streaming decompression buffer + ~4 MiB channel backpressure
+  #   - Cache miss: ~1 MiB TeeStream buffer + ~4 MiB incremental write buffer
+  # Formula: total_proxy_memory ≈ base (~200 MiB) + max_concurrent_requests × 5 MiB
+  # Examples: 200 requests ≈ 1.2 GB, 500 ≈ 2.7 GB, 1000 ≈ 5.2 GB, 2000 ≈ 10.2 GB
+  # This formula covers the streaming paths only (signed writes, cache-miss GET).
+  # It does not cover the paths that still buffer a whole body or range in
+  # memory — size max_inflight_buffer_bytes below for those separately.
+  # Tuning guide (starting points — these bands predate 2.5.0, when a permit covered
+  # only request setup rather than the whole transfer, so the same number now admits
+  # fewer simultaneous requests). Confirm against /metrics permits_held_peak under
+  # your own load; a 100-client fleet test of 8 MiB ranged reads peaked at 71.
+  #   Small deployments (< 50 users): 50-100
+  #   Medium deployments (50-500 users): 100-300
+  #   Large deployments (500+ users): 300-1000+
+  #   High-throughput scenarios: 1000+
+  max_concurrent_requests: 1000
+  request_timeout: "30s"
+  # Add Referer header for proxy identification in OBS Server Access Logs (default: true)
+  # Format: Hybrid Cache for OBS/{version} ({hostname})
+  add_referer_header: true
+  # Deprecated compatibility setting. Existing configurations may keep this value,
+  # but it no longer controls upload size or memory use. S3's 5 GiB single-part PUT
+  # and UploadPart maximum applies instead. This field will be removed in a future release.
+  # max_buffered_request_body_bytes: 5368709120
+  # Cache-tee channel depth for the streaming signed-write path, in frames (default: 5).
+  # On a streamed PUT/UploadPart the body is forwarded to the upstream verbatim while each
+  # frame is tee'd to the write-through cache over a bounded channel of this many frames.
+  # Per-connection streaming-cache memory is one in-flight frame plus this many queued frames.
+  # A frame is a single forwarded request-body frame, bounded by the HTTP read buffer, so the
+  # default of 5 keeps it on par with the GET path — independent of object size.
+  # Raising it can improve cache-write throughput at the cost of more per-connection memory.
+  # write_cache_tee_channel_depth: 5
+
+  # Maximum total bytes held simultaneously across all buffered request and response
+  # bodies (default: 0, disabled). Bounds the paths that still buffer a whole body or
+  # range rather than streaming it — since 2.5.0 these are response-side almost
+  # exclusively (range merge, page widening, buffered range serving, recovery
+  # fallbacks), plus small non-GET/PUT request bodies such as a DeleteObjects POST.
+  # NOT the streaming paths covered by max_concurrent_requests above; every upload
+  # path streams. A request whose buffered body would exceed this ceiling gets
+  # HTTP 503 SlowDown with Retry-After (never 413), before any upstream connection
+  # is opened.
+  # Size alongside cache.max_ram_cache_size and instance memory: start at roughly
+  # instance_ram / 4 - cache.max_ram_cache_size, then confirm against /metrics ->
+  # inflight_memory.peak_reserved_bytes under real traffic and adjust. On a 4 GiB
+  # c6in.large with the default 512 MiB RAM cache that is 536870912 (512 MiB).
+  # A non-zero value below 1 MiB fails validation at startup; 0 is exempt.
+  # max_inflight_buffer_bytes: 0
+
+  # TLS Proxy Listener Configuration
+  # Terminates TLS using the proxy's own certificate, then processes decrypted HTTP
+  # through the caching pipeline. Use with HTTP_PROXY=https://proxy-host:3129.
+  # Note: tls_proxy_port is distinct from https_port — https_port is TCP passthrough
+  # (no caching), while tls_proxy_port terminates TLS and enables full caching.
+  tls:
+    # Whether the TLS proxy listener is active (default: false)
+    enabled: false
+    # Port for the TLS proxy listener (default: 3129)
+    # Named tls_proxy_port to distinguish from https_port which is TCP passthrough
+    tls_proxy_port: 3129
+    # Path to PEM-encoded certificate chain file
+    cert_path: "/etc/proxy/tls/cert.pem"
+    # Path to PEM-encoded private key file
+    key_path: "/etc/proxy/tls/key.pem"
+
+cache:
+  cache_dir: "./tmp/cache"  # Local development; use absolute path for production (e.g., "/mnt/cache")
+  max_cache_size: 524288000  # 500MB in bytes
+  ram_cache_enabled: true
+  # Default: 512MB (raised from 256MB). At 8 shards this yields exactly the
+  # 64 MiB RAM_CACHE_ADMISSION_CEILING per shard, preserving 8-way concurrency
+  # while guaranteeing any single entry up to 64 MiB is admitted rather than
+  # silently dropped. See "Number of independent shards" below.
+  max_ram_cache_size: 536870912  # 512MB in bytes
+  # Number of independent shards in the RAM cache (default: 8).
+  # Each shard has its own lock, so concurrent requests hitting different shards
+  # never contend with each other.
+  #
+  # Per-shard capacity = max_ram_cache_size / effective_shard_count, where
+  # effective_shard_count = min(ram_cache_shard_count, max(1, max_ram_cache_size / 67108864)).
+  # The proxy unconditionally clamps the shard count so per-shard capacity never
+  # falls below the hardcoded 64 MiB (67108864 byte) admission ceiling — this
+  # guarantees any single entry up to 64 MiB is admitted to RAM rather than
+  # silently dropped, independent of whether page-aligned range caching is used.
+  # Example: 512MB / 8 shards = 64MB per shard (no clamp; exactly the ceiling).
+  # Example: 256MB / 8 shards would be 32MB per shard, so it clamps to 4
+  # effective shards (256MB / 64MB) and logs a warning.
+  #
+  # Objects larger than the per-shard capacity are silently dropped from the RAM
+  # cache. The proxy logs a warning at startup if per-shard capacity falls below
+  # 1MB — use that as a signal to lower the shard count or increase
+  # max_ram_cache_size.
+  #
+  # Tuning guidance:
+  #   Higher values (e.g. 32, 64) — lower contention under extreme concurrency
+  #     (hundreds of parallel requests hitting distinct keys); most deployments
+  #     see no additional gain beyond 8–16 shards. Raise max_ram_cache_size
+  #     alongside the shard count to avoid the 64 MiB clamp reducing it back down.
+  #   Lower values (e.g. 1, 2) — larger per-shard capacity buckets; useful for
+  #     very small caches or workloads dominated by a few large objects.
+  #
+  # Valid range: 1–256
+  ram_cache_shard_count: 8
+  eviction_algorithm: "tinylfu"  # Options: "lru" (default), "tinylfu" - unified for both RAM and disk caches
+  
+  # Write-through caching for PUT operations and multipart uploads
+  # When enabled, PUT operations and multipart uploads are cached so subsequent
+  # GET requests can be served from cache immediately without fetching from S3
+  # On the first GET the entry transitions from put_ttl to get_ttl (one-time, not a
+  # repeating refresh)
+  # When disabled, PUT operations are forwarded directly to S3 without caching
+  write_cache_enabled: true  # Enable write-through caching (enabled by default)
+  
+  # Percentage of total disk cache reserved for write cache (default: 10%)
+  # Valid range: 1.0 to 50.0
+  # Write cache is limited to this percentage to prevent starving read cache
+  write_cache_percent: 10.0
+  
+  # Maximum object size for write caching (default: 256MB)
+  # Objects larger than this are not cached on PUT
+  write_cache_max_object_size: 268435456  # 256MB in bytes
+  
+  # TTL for write-cached objects (default: 1 hour)
+  # On the first GET the entry transitions from put_ttl to get_ttl (one-time, not a
+  # repeating refresh), so this bounds how long a written object stays cached before
+  # it is first read.
+  # Valid range: 1 minute ("1m") to 30 days ("30d")
+  put_ttl: "3600s"  # 1 hour
+  
+  # TTL for incomplete multipart uploads before automatic cleanup (default: 1 day)
+  # Valid range: 1 hour ("1h") to 7 days ("7d")
+  # Incomplete uploads that exceed this TTL are automatically evicted
+  # This prevents abandoned uploads from consuming cache space indefinitely
+  incomplete_upload_ttl: "1d"  # 1 day
+  
+  # Maximum CompleteMultipartUpload body size in bytes (default: 10 MiB = 10485760)
+  # Bodies exceeding this limit are rejected with HTTP 413 before forwarding to S3.
+  # The S3 maximum of 10,000 parts results in a body well under 1 MiB in practice.
+  # max_complete_body_bytes: 10485760
+  
+  get_ttl: "315360000s"  # ~10 years (infinite caching - cache forever unless explicit headers)
+  head_ttl: "60s"  # 1 minute - validates object freshness via HEAD without re-downloading
+  actively_remove_cached_data: false  # false = lazy expiration (default), true = active background removal
+  
+  # RAM-Disk Cache Coherency Settings
+  # When RAM cache is enabled, these settings control how RAM cache accesses
+  # are propagated to disk metadata for accurate eviction decisions
+  ram_cache_flush_interval: "10s"        # Default: 10s
+  ram_cache_flush_threshold: 100         # Default: 100
+  ram_cache_flush_on_eviction: false     # Default: false
+  ram_cache_verification_interval: "1s"  # Default: 1s
+  
+  # ============================================================================
+  # SHARED STORAGE CONFIGURATION
+  # ============================================================================
+  # Coordination settings for the journal-based metadata system and distributed
+  # eviction locking. These are always active — they provide the consistency
+  # guarantees needed for multi-instance deployments sharing a cache volume
+  # (NFS, shared PersistentVolume) and also apply to single-instance setups.
+  # ============================================================================
+  shared_storage:
+    
+    # --------------------------------------------------------------------------
+    # LOCK TIMING CONFIGURATION
+    # --------------------------------------------------------------------------
+    
+    # Maximum time to wait when acquiring a file lock before giving up.
+    # Longer values handle slow storage; shorter values fail faster on contention.
+    # Valid range: 10-300 seconds
+    lock_timeout: "60s"
+    
+    # How often to refresh held locks to prevent expiration.
+    # Must be less than lock_timeout to maintain lock ownership.
+    # Valid range: 5-120 seconds
+    lock_refresh_interval: "30s"
+    
+    # --------------------------------------------------------------------------
+    # DISTRIBUTED EVICTION LOCK CONFIGURATION
+    # --------------------------------------------------------------------------
+    # When cache exceeds size limits, only one instance should perform eviction
+    # at a time to prevent over-eviction and cache thrashing.
+    
+    # Maximum time an instance can hold the global eviction lock before it's
+    # considered stale. Other instances can forcibly acquire stale locks to
+    # prevent deadlocks from crashed instances.
+    #
+    # Valid range: 30-3600 seconds (30 seconds to 1 hour)
+    #
+    # RECOMMENDED VALUES:
+    #   - Small caches (<10GB): 60s (default) - fast recovery from crashes
+    #   - Medium caches (10-100GB): 120s - allows time for larger evictions
+    #   - Large caches (>100GB): 300s - prevents premature lock takeover
+    #   - Very slow storage (high-latency NFS): 600s - accounts for I/O delays
+    #
+    # If eviction consistently takes longer than this timeout, increase the value
+    # to prevent other instances from forcibly acquiring the lock mid-eviction.
+    eviction_lock_timeout: "60s"
+    
+    # --------------------------------------------------------------------------
+    # VALIDATION THRESHOLDS
+    # --------------------------------------------------------------------------
+    
+    # Cache inconsistency percentage that triggers a warning log.
+    # Helps identify emerging issues before they become critical.
+    # Valid range: 0.0-100.0, must be less than validation_threshold_error
+    validation_threshold_warn: 5.0
+    
+    # Cache inconsistency percentage that triggers an error log.
+    # Indicates significant coordination problems requiring attention.
+    # Valid range: 0.0-100.0, must be greater than validation_threshold_warn
+    validation_threshold_error: 20.0
+    
+    # --------------------------------------------------------------------------
+    # RECOVERY CONFIGURATION
+    # --------------------------------------------------------------------------
+    
+    # Maximum number of orphaned ranges to recover simultaneously.
+    # Higher values speed up recovery but increase I/O load.
+    # Valid range: 1-16
+    recovery_max_concurrent: 4
+    
+    # --------------------------------------------------------------------------
+    # JOURNAL CONSOLIDATION SETTINGS
+    # --------------------------------------------------------------------------
+    
+    # How often to consolidate journal entries into final metadata files.
+    # Shorter intervals improve cross-instance cache visibility.
+    # Valid range: 1-60 seconds
+    consolidation_interval: "5s"
+    
+    # When journal file exceeds this size, trigger immediate consolidation.
+    # Valid range: 100KB-10MB
+    consolidation_size_threshold: 1048576  # 1MB in bytes
+    
+    # Maximum duration for the per-key processing phase of a consolidation cycle (default: 30s)
+    # Prevents one slow NFS operation from blocking the next cycle or holding locks indefinitely.
+    # Keys not processed due to timeout are retried in the next cycle.
+    consolidation_cycle_timeout: "30s"
+    
+    # Number of times to retry lock acquisition before giving up.
+    # Valid range: 1-20
+    lock_max_retries: 5
+    
+    # How often to run background validation of metadata consistency.
+    # Valid range: 1-168 hours
+    validation_frequency: "23h"
+
+    # --------------------------------------------------------------------------
+    # ORPHAN RECOVERY CONFIGURATION
+    # --------------------------------------------------------------------------
+    # Background scan that finds .bin range files not referenced by any metadata
+    # (e.g. crashed writers, consolidation lag) and either reconciles them into
+    # metadata or removes them. Runs one shard per cycle to spread I/O load.
+
+    # Enable background orphan recovery (default: true)
+    orphan_recovery_enabled: true
+
+    # Interval between orphan recovery scans (default: 300s = 5 minutes)
+    # Valid range: 60-3600 seconds
+    orphan_recovery_interval: "300s"
+
+    # Maximum time to spend scanning per cycle (default: 30s)
+    # Prevents long scans from blocking other operations.
+    # Valid range: 5-300 seconds
+    orphan_scan_timeout: "30s"
+
+    # Maximum orphans to process per recovery cycle (default: 100)
+    # Remaining orphans are processed in subsequent cycles.
+    # Valid range: 10-1000
+    orphan_max_per_cycle: 100
+  
+    # Maximum duration for a single validation scan cycle (default: 4h).
+    # This is the single knob for self-tuning mode selection:
+    # - If a full scan exceeds this budget, the next cycle switches to rolling mode
+    # - Rolling mode processes a subset of directories per cycle and resumes next time
+    # - When rolling mode estimates a full scan would fit within this budget, it switches back
+    # Valid range: 10 minutes ("10m") to 23 hours ("23h")
+    # Default: "4h"
+    validation_max_duration: "4h"
+  
+  # ============================================================================
+  # DOWNLOAD COORDINATION CONFIGURATION
+  # ============================================================================
+  # Controls request coalescing for concurrent cache misses. When multiple requests
+  # arrive for the same uncached resource, only one request fetches from S3 while
+  # others wait. This reduces redundant S3 fetches and improves cache efficiency.
+  # ============================================================================
+  download_coordination:
+    # Enable download coordination/coalescing (default: true)
+    # When enabled, concurrent requests for the same uncached resource are coalesced.
+    # When disabled, each cache miss independently fetches from S3.
+    enabled: true
+    
+    # Maximum time a waiter will wait for the fetcher to complete (default: 30s)
+    # If the fetcher takes longer than this, the waiter falls back to its own S3 fetch.
+    # Valid range: 5-120 seconds (values outside this range are clamped with a warning)
+    wait_timeout_secs: 30
+  
+  # Range merge gap threshold for intelligent range consolidation (default: 1048576 bytes = 1MiB)
+  range_merge_gap_threshold: 1048576  # 1MiB in bytes
+  
+  # DEPRECATED: eviction_buffer_percent has no effect. Use eviction_trigger_percent
+  # and eviction_target_percent instead. This field will be removed in a future release.
+  # eviction_buffer_percent: 5
+
+  # Eviction trigger / target (percent of max_cache_size)
+  # Eviction begins when cache usage reaches eviction_trigger_percent and continues
+  # until usage drops to eviction_target_percent. Keeping a gap between the two
+  # prevents thrashing where eviction starts and stops repeatedly near the limit.
+  # eviction_trigger_percent: valid range 50-100 (default: 95)
+  # eviction_target_percent:  valid range 50-99, must be less than trigger (default: 80)
+  eviction_trigger_percent: 95
+  eviction_target_percent: 80
+
+  # Honour client cache-bypass request headers (default: true)
+  # When true, a request carrying `Cache-Control: no-cache`, `Pragma: no-cache`, or
+  # `Cache-Control: no-store` bypasses the cache for that request. Set to false to
+  # ignore these headers (clients cannot opt out of caching).
+  cache_bypass_headers_enabled: true
+  
+  # Cache initialization configuration
+  initialization:
+    parallel_scan: true
+    scan_timeout: "30s"
+    progress_logging: true
+  
+  # ============================================================================
+  # RAM METADATA CACHE CONFIGURATION
+  # ============================================================================
+  # Controls the in-memory cache for NewCacheMetadata objects, reducing disk I/O
+  # for both HEAD and GET requests. Uses simple LRU eviction since all metadata
+  # entries are similar size (~1-2KB).
+  #
+  # This cache sits between the proxy and disk storage:
+  # - On cache hit: metadata served from RAM (microseconds)
+  # - On cache miss/stale: metadata read from disk and cached in RAM
+  #
+  # Memory usage: ~1.5-2.5KB per entry
+  # Example: 10,000 entries ≈ 15-25MB RAM
+  # ============================================================================
+  metadata_cache:
+    # Enable/disable the RAM metadata cache (default: true)
+    # When disabled, all metadata reads go directly to disk
+    enabled: true
+    
+    # How often to re-read from disk to check for changes (default: 5s)
+    # This is the staleness threshold - entries older than this are refreshed.
+    # Lower values = fresher data but more disk I/O
+    # Higher values = less disk I/O but potentially stale data
+    # Valid range: 1-300 seconds
+    refresh_interval: "5s"
+    
+    # Maximum number of entries in the cache (default: 100000)
+    # Each entry is ~1-2KB, so 100000 entries uses ~150-250MB of RAM.
+    # Increase for workloads with many unique objects.
+    # Valid range: 100-1000000
+    max_entries: 100000
+    
+    # Maximum retries for stale file handle errors (default: 3)
+    # On shared storage (NFS), stale file handles can occur when files
+    # are modified by other instances. This controls retry behavior.
+    # Valid range: 1-10
+    stale_handle_max_retries: 3
+
+  # Content-length threshold above which range requests skip the full-object cache check (default: 64 MiB)
+  # Large files are unlikely to be cached as a single full-object range, so skipping the check
+  # avoids scanning hundreds of cached ranges unnecessarily.
+  full_object_check_threshold: 67108864  # 64 MiB in bytes
+
+  # Enable/disable read caching for GET responses globally (default: true)
+  # When false, nothing is read-cached unless a matching cache_rules.json rule sets read_cache_enabled: true.
+  # This allows an "allowlist" pattern where only keys matched by an enabling rule have caching.
+  read_cache_enabled: true
+
+  # Evaluate client conditional headers (If-Match, If-None-Match, If-Modified-Since,
+  # If-Unmodified-Since) against cached metadata instead of forwarding to S3 (default: true).
+  # When true (default): If-Match requests are served directly from cache when the cached ETag
+  # matches and the data is fully cached — no S3 round trip. This is the optimal setting for
+  # the S3-protocol CLI CRT client, which stamps If-Match on every ranged GET of a multipart download.
+  # If-None-Match, If-Modified-Since, and If-Unmodified-Since always forward to S3 regardless.
+  # When false: every conditional request is forwarded to S3 (S3 evaluates the precondition);
+  # use this for maximum S3-authoritative consistency. Per-key override via cache_rules.json.
+  evaluate_conditions_from_cache: true
+
+  # How long the loaded cache_rules.json rule set is considered fresh before re-reading from disk (default: 60s)
+  # Controls lazy reload — rule changes take effect after this threshold expires.
+  bucket_settings_staleness_threshold: "60s"
+
+  # Disk streaming threshold for cached range data (default: 1 MiB)
+  # Ranges at or above this size are streamed from disk in chunks instead of loaded fully into memory.
+  # Reduces memory usage for large range responses under high concurrency.
+  disk_streaming_threshold: 1048576  # 1 MiB in bytes
+
+  # Size of compression batches during cache writes (default: 1 MiB).
+  # Each cache miss write groups incoming S3 bytes into batches of this size
+  # before producing an LZ4 frame. Larger batches give better compression
+  # ratio and less per-frame overhead; smaller batches reduce per-request
+  # peak memory.
+  # Valid range: 65536 (64 KiB) to 16777216 (16 MiB).
+  compression_batch_size: 1048576
+
+  # Maximum .meta file size the proxy will read from disk (default: 4 MiB = 4194304).
+  # Files exceeding this cap are treated as corrupt without being read, preventing
+  # pathologically large metadata files (e.g. legacy inline-body entries) from blocking
+  # the runtime or consuming unbounded memory. Normal .meta files are ~2 KB.
+  # max_metadata_file_bytes: 4194304
+
+  # Maximum concurrent blocking metadata I/O operations (default: 32).
+  # A process-wide semaphore with this capacity gates spawn_blocking metadata reads.
+  # Prevents overwhelming the blocking thread pool and NFS under high concurrency.
+  # Lower for constrained NFS mounts; higher for local SSD with many cores.
+  # metadata_io_concurrency: 32
+
+  # Minimum received fraction (0.0–1.0) of an incomplete range to salvage on the
+  # read/GET cache-write path (default: 0.5). If a streamed range cache write ends
+  # early (client cancelled, or the mid-stream idle watchdog aborted) but at least
+  # this fraction of the requested bytes arrived in order, the received prefix is
+  # committed as a smaller valid range instead of being discarded — so a single
+  # high-throughput (e.g. CRT) download still populates the cache when some part
+  # requests are cut short. 1.0 = only commit fully-received ranges (legacy);
+  # 0.0 = commit any non-empty prefix. The write-through PUT path is unaffected
+  # (a truncated upload is never cached).
+  # partial_range_commit_ratio: 0.5
+
+logging:
+  access_log_dir: "./tmp/logs/access"  # Local development; use absolute path for production (e.g., "/mnt/logs/access")
+  app_log_dir: "./tmp/logs/app"        # Local development; use absolute path for production (e.g., "/mnt/logs/app")
+  access_log_enabled: true
+  access_log_mode: "all"  # Options: "all" (default), "cached_only"
+  log_level: "info"
+  
+  # Buffered access log settings (reduces disk I/O on shared storage)
+  # Access log entries are buffered in RAM and flushed periodically
+  access_log_flush_interval: "5s"  # How often to flush buffered entries (default: 5s)
+  access_log_buffer_size: 1000     # Max entries before forced flush (default: 1000)
+  
+  # Log lifecycle management
+  # Each proxy instance manages its own log cleanup independently.
+  # No inter-instance coordination is needed on shared storage.
+  #
+  # Retention is a property of the DIRECTORY, not of whether this instance is
+  # writing. Both sweeps run regardless of access_log_enabled, and both cover files
+  # left by other instances, so an orphaned file is reaped even though its writer is
+  # gone. Only files matching the documented naming convention are ever removed.
+  #
+  # A file this instance did not write gets one extra day of grace before it becomes
+  # a candidate, so the effective guarantee is `retention_days` for a live writer's
+  # own files and `retention_days + 1` for an orphaned one. For a compliance-driven
+  # hard cap at N days, configure N-1. See docs/ACCESS_LOG_FORMAT.md.
+  access_log_retention_days: 30              # Days to retain access log files (default: 30, range: 1-365)
+  app_log_retention_days: 30                 # Days to retain application log files (default: 30, range: 1-365)
+  log_cleanup_interval: "24h"                # How often the background cleanup task runs (default: 24h, range: 1h-7d)
+  access_log_file_rotation_interval: "5m"    # Time window for appending to same access log file before rotating (default: 5m, range: 1m-60m)
+
+connection_pool:
+  # DEPRECATED: max_connections_per_ip has no effect. Connection pooling is managed by
+  # max_idle_per_host and max_idle_per_ip. This field will be removed in a future release.
+  # max_connections_per_ip: 50
+  dns_refresh_interval: "60s"  # 1 minute
+  connection_timeout: "10s"
+  idle_timeout: "55s"  # Just under S3's ~60s server-side timeout to avoid reusing stale connections
+  keepalive_enabled: true
+  max_idle_per_host: 100  # More idle connections = more memory, fewer TLS handshakes during bursts
+  max_lifetime: "300s"
+  pool_check_interval: "10s"
+  # Custom DNS servers for S3 endpoint resolution (default: Google DNS + Cloudflare DNS)
+  # The proxy bypasses /etc/hosts and uses these servers to resolve S3 endpoints.
+  # Format: list of IP addresses. Empty list uses default (Google DNS + Cloudflare DNS).
+  # For VPC Endpoint deployments, point at the endpoint DNS resolver IPs.
+  # dns_servers: ["10.0.1.50", "10.0.2.50"]
+  # endpoint_overrides: Hostname-to-IP mappings that bypass DNS resolution.
+  # Useful for OBS VPC Endpoint where the proxy cannot use DNS to resolve OBS endpoints
+  # to VPC Endpoint ENI IPs (e.g., on-prem deployments without the endpoint resolver).
+  # Each key maps to a list of IP addresses. The proxy load-balances across them.
+  #
+  # Keys starting with "*." are suffix patterns — they match any hostname ending
+  # with that suffix. Exact matches take precedence over suffix matches; among
+  # suffix matches the longest (most specific) suffix wins.
+  #
+  # When any overrides are configured, outbound TLS is locked to 1.2 for VPC
+  # interface endpoint compatibility.
+  #
+  # endpoint_overrides:
+  #   # Exact match — single specific hostname
+  #   "obs.cn-north-4.myhuaweicloud.com": ["10.0.1.100", "10.0.2.100"]
+  #
+  #   # Suffix match — all virtual-hosted bucket hostnames in a region
+  #   "*.obs.cn-north-4.myhuaweicloud.com": ["10.0.1.100", "10.0.2.100"]
+  #
+  #   # Suffix match — all MRAP hostnames via the global accesspoint VPCE
+  #   "*.obs-accesspoint.cn-north-4.myhuaweicloud.com": ["10.0.3.100"]
+  #
+  #   # Suffix match — regional access points
+  #   "*.obs-accesspoint.cn-north-4.myhuaweicloud.com": ["10.0.1.100", "10.0.2.100"]
+  #
+  #   # Cross-region bucket access
+  #   "*.obs.ap-southeast-1.myhuaweicloud.com": ["10.0.4.100", "10.0.4.101"]
+  #
+  # upstream_overrides: Per-destination upstream transport overrides. Empty by default:
+  # every caching-egress destination uses verified TLS on port 443. Set entries only for
+  # the specific stores you front on a non-standard transport.
+  #
+  # Each key is "host:port" (the port is part of the key). Each value is
+  # { scheme: http|https, validate_tls: <bool> }, selecting one of three transport modes:
+  #   - scheme: http                        → plaintext HTTP, no TLS handshake
+  #   - scheme: https, validate_tls: true   → HTTPS verified against the system trust store (default)
+  #   - scheme: https, validate_tls: false  → HTTPS with NO certificate verification
+  # validate_tls defaults to true when omitted (secure by default; skipping validation
+  # is an explicit opt-in). There is no custom-CA mode — validation is full or none.
+  #
+  # Matching: an IP literal matches that IP exactly. A DNS name matches itself AND any
+  # subdomain, so "store.local:9000" also covers "bucket.store.local:9000" (path-style
+  # and virtual-hosted addressing from one entry). A bare "*" matcher is rejected.
+  # Hostnames resolve via the configured external DNS above (never /etc/hosts), so a
+  # publicly-resolvable name like obs.<region>.myhuaweicloud.com resolves to the real origin.
+  # Independent of endpoint_overrides (IP resolution + its TLS-1.2 lock) — they compose.
+  #
+  # SECURITY: scheme: http (cleartext exposure) and validate_tls: false (loss of MITM
+  # protection on the proxy→origin leg) WAIVE a protection. Use them for LOCAL
+  # DEVELOPMENT or TRUSTED NETWORKS ONLY — never across untrusted networks. The proxy
+  # logs a startup warning for each protection-waiving entry. Validated HTTPS waives
+  # nothing and is not warned.
+  #
+  # UPSTREAM PORT SOURCE: the upstream port comes from the request. In forward-proxy
+  # mode the absolute-form request authority carries the upstream host:port, so the
+  # proxy dials any port the client targets. In standard (hosts-file) mode the port
+  # comes from the Host header (defaulting to 80) and the proxy intercepts only the
+  # single http_port it is bound to (plus the 443 TCP passthrough, which does not
+  # cache): point http_port at a non-standard port and that one port is intercepted,
+  # but reaching several ports — or leaving the listener on 80/443 while fronting a
+  # store elsewhere — needs proxy mode. The transport (plaintext vs TLS, and TLS
+  # validation) is selectable on whatever port the request targets in either mode.
+  # Either way the upstream hostname resolves via dns_servers (never /etc/hosts), so it
+  # must resolve to the real origin, not back to the proxy.
+  #
+  # upstream_overrides:
+  #   # Plaintext local store (e.g. MinIO/RustFS on :9000) — cleartext, dev only
+  #   "127.0.0.1:9000": { scheme: http }
+  #
+  #   # Customer store with a publicly-trusted cert on a non-443 port — validated HTTPS
+  #   "store.example.com:9000": { scheme: https, validate_tls: true }
+  #
+  #   # Self-signed store in a trusted network — HTTPS, no cert verification, trusted-net only
+  #   "store.local:9000": { scheme: https, validate_tls: false }
+  # IP Distribution: create separate hyper connection pools per S3 IP address.
+  # When enabled, the proxy rewrites request URI authorities from hostname to individual
+  # IP addresses, causing hyper to maintain per-IP connection pools. This distributes
+  # connections across all S3 frontend servers instead of concentrating on a subset.
+  # Improves reliability by avoiding per-IP throttling and follows S3-SDK best practices.
+  # TLS SNI and Host headers are preserved for SigV4 compatibility.
+  ip_distribution_enabled: true  # Enable per-IP connection pool distribution (default: true)
+  # Maximum idle connections per IP when IP distribution is enabled (default: 10)
+  # With N S3 IPs (typically ~8), total idle connections ≈ N × max_idle_per_ip (~80).
+  # When IP distribution is disabled, max_idle_per_host (above) is used instead.
+  # Valid range: 1-100
+  max_idle_per_ip: 10
+  # TCP keepalive settings applied via socket2 before TLS handshake.
+  # Detects dead connections at the TCP layer before hyper tries to reuse them.
+  keepalive_idle_secs: 15     # Seconds idle before first probe (default: 15)
+  keepalive_interval_secs: 5  # Seconds between probes (default: 5)
+  keepalive_retries: 3        # Failed probes before connection is dead (default: 3)
+  # TCP receive buffer size hint (SO_RCVBUF) in bytes. Default: null (kernel auto-tune).
+  # Leave this unset/null so the Linux kernel dynamically auto-tunes the TCP receive
+  # window (up to net.core.rmem_max). Auto-tuning is REQUIRED for full single-stream
+  # throughput on high-RTT cross-region paths — a small fixed window caps bandwidth
+  # over long round-trips. Setting an explicit value pins SO_RCVBUF, which DISABLES
+  # kernel auto-tuning; only do so if you have a specific reason to override the kernel.
+  tcp_recv_buffer_size: null
+  # Consecutive failures before excluding an IP from round-robin distribution (default: 3).
+  # An excluded IP is NOT restored by a DNS refresh — it returns only when a recovery
+  # probe (TCP connect + TLS handshake) confirms it is reachable. See the two
+  # health_probe_* settings below.
+  ip_failure_threshold: 3
+  # Recovery probing for excluded IPs. After health_probe_initial_cooldown an excluded
+  # IP becomes eligible to be probed; probes run once per pool_check_interval. A probe
+  # success returns the IP to rotation immediately. A probe failure doubles that IP's
+  # cooldown, up to health_probe_max_cooldown, so an unreachable IP is retried
+  # progressively less often instead of on every refresh. Each probe is bounded by
+  # connection_timeout. Lower the initial cooldown for faster recovery from transient
+  # failures; raise the maximum to back off harder on a persistently dead IP.
+  # health_probe_initial_cooldown: "5s"
+  # health_probe_max_cooldown: "300s"
+  # Maximum registered endpoints for DNS-based IP distribution (default: 10000).
+  # Prevents unbounded growth from excessive unique hostnames. Normal S3 usage is
+  # well under this cap. Existing endpoints keep working when the cap is reached.
+  # max_registered_endpoints: 10000
+
+  # Upstream timeout settings for the proxy's own S3 fetch (stalled-response fast-fail).
+  # These apply AFTER download-coordinator acquisition — coordination waits are unaffected.
+
+  # Connect-to-first-byte timeout (default: 5s). How long the proxy waits after
+  # connecting before receiving the first response byte. Above cross-region TTFB tails,
+  # well below the 60s client read-timeout. On timeout (before bytes to client), the
+  # fetch is retried up to upstream_idle_retries times.
+  # upstream_first_byte_timeout: "5s"
+
+  # Mid-stream idle timeout (default: 5s). If no bytes are received from upstream for
+  # this duration after data has started flowing, the client connection is terminated
+  # (client retries). A slow-but-steady transfer is never aborted.
+  # upstream_idle_timeout: "5s"
+
+  # Pre-stream retry budget (default: 2). Number of retries when first-byte timeout
+  # fires before any bytes have been sent to the client.
+  # upstream_idle_retries: 2
+
+  # Hedged upstream requests — per-instance governor. Hedging is ENABLED per key pattern
+  # in cache_rules.json (hedging_enabled, hedge_trigger_after, hedge_max_per_request).
+  # There is no fleet-wide on/off toggle; this section only caps the global in-flight
+  # hedge ratio to bound cost amplification.
+  # hedged_requests:
+  #   # Maximum fraction of in-flight fetches that may be hedges (default: 0.1).
+  #   # When the ratio exceeds this value, new hedges are suppressed. Note the first
+  #   # hedge is always admitted when none are in flight, so 0.0 does NOT disable
+  #   # hedging — remove hedging_enabled from the rules for that. See docs/HEDGING.md.
+  #   # Valid range: [0.0, 1.0].
+  #   max_inflight_fraction: 0.1
+
+compression:
+  enabled: true
+  # Size floor in bytes below which writes always skip compression, regardless
+  # of extension or any cache_rules.json override. (default: 1024)
+  threshold: 1024
+  preferred_algorithm: "lz4"  # only "lz4" is implemented; parsed but otherwise inert
+  # `content_aware` has been removed — it never had any effect (content-aware
+  # filtering, i.e. the built-in extension denylist, was always applied
+  # unconditionally regardless of this field's value). Use a cache_rules.json
+  # rule's `compression_enabled` field to override the denylist per key; see
+  # docs/COMPRESSION.md and docs/CONFIGURATION.md.
+
+health:
+  enabled: true
+  # This listener serves only GET /health. Other paths return 404; other methods return 405.
+  endpoint: "/health"
+  port: 8080
+  # bind_address: "0.0.0.0"  # Default: all interfaces. Use "127.0.0.1" to restrict to loopback.
+  check_interval: "30s"
+
+metrics:
+  enabled: true
+  # This listener serves only GET /metrics. Other paths return 404; other methods return 405.
+  endpoint: "/metrics"
+  port: 9090
+  # bind_address: "0.0.0.0"  # Default: all interfaces. Use "127.0.0.1" to restrict to loopback.
+  collection_interval: "60s"
+  # DEPRECATED: include_cache_stats, include_compression_stats, include_connection_stats
+  # have no effect. All stats are always included. These fields will be removed in a future release.
+  # include_cache_stats: true
+  # include_compression_stats: true
+  # include_connection_stats: true
+  otlp:
+    enabled: false
+    endpoint: "http://localhost:4318"
+    export_interval: "60s"
+    timeout: "10s"
+    compression: "none"
+    headers: {}
+    # Per-bucket traffic metrics (always tracked in memory; OTLP export is gated separately)
+    # per_bucket_enabled: false      # Export per-bucket counters via OTLP (default: false)
+
+  # Per-bucket metrics accounting knobs (always-on; feed /metrics and the dashboard).
+  # The OTLP export gate is metrics.otlp.per_bucket_enabled (above).
+  # per_bucket:
+  #   max_series: 100              # Max distinct bucket[+prefix] series (default: 100)
+  #                                # Beyond this, traffic folds into an "__other__" entry.
+  #   bucket_prefixes:             # Optional per-bucket prefix lists for prefix-level attribution.
+  #     my-bucket:                 # Key: bucket name. Value: list of prefix strings.
+  #       - "logs/"
+  #       - "data/raw/"
+
+dashboard:
+  enabled: true
+  port: 8081
+  # The dashboard is UNAUTHENTICATED and READ-ONLY (cache stats, log viewer, system info).
+  # It exposes no write operations and no credentials (presigned params are masked in logs).
+  #
+  # bind_address controls who can reach it:
+  #   "127.0.0.1" — localhost only (code default; safest — use SSH tunnel for remote access)
+  #   "0.0.0.0"   — all interfaces (convenient, but you MUST restrict access via security
+  #                  groups, firewall rules, or network segmentation when non-loopback)
+  #
+  # The value below is deliberately "0.0.0.0" so the dashboard is reachable in the example
+  # deployment. See docs/DASHBOARD.md "Security Considerations" for the access model and the
+  # operator responsibilities that come with a non-loopback bind.
+  #
+  # For remote monitoring without exposing the port: bind to 127.0.0.1 and use an SSH tunnel:
+  #   ssh -L 8081:127.0.0.1:8081 proxy-host
+  # Then open http://localhost:8081 in your browser.
+  bind_address: "0.0.0.0"
+  cache_stats_refresh_interval: "5s"
+  logs_refresh_interval: "10s"
+  # DEPRECATED: max_log_entries has no effect. This field will be removed in a future release.
+  # max_log_entries: 100
+
+# ==============================================================================
+# PROXY-ONLY MODE EXAMPLE
+# ==============================================================================
+# Starts only the HTTP forward proxy on port 3128. No sudo, DNS changes, or
+# /etc/hosts modifications needed. Clients set HTTP_PROXY to route S3 traffic.
+#
+# Minimal configuration:
+#
+# server:
+#   mode: "proxy_only"
+#   proxy_port: 3128
+#
+# cache:
+#   cache_dir: "/mnt/cache"
+#   max_cache_size: 524288000  # 500MB
+#
+# Client usage (see docs/ARCHITECTURE.md "What a Cleartext Hop Exposes" for the transport
+# implications of the http:// endpoint below, and the TLS variant that follows):
+#   export HTTP_PROXY=http://127.0.0.1:3128
+#   export NO_PROXY=169.254.169.254
+#   obsutil cp obs://bucket/key ./local \
+#     --endpoint-url http://obs.cn-north-4.myhuaweicloud.com
+#   # For repeated S3-protocol commands against buckets in cn-north-4:
+#   export OBS_ENDPOINT=http://obs.cn-north-4.myhuaweicloud.com
+#
+# With TLS (encrypted client-to-proxy):
+#
+# server:
+#   mode: "proxy_only"
+#   proxy_port: 3128
+#   tls:
+#     enabled: true
+#     tls_proxy_port: 3129
+#     cert_path: "/etc/proxy/tls/cert.pem"
+#     key_path: "/etc/proxy/tls/key.pem"
+#
+# Client usage (TLS):
+#   export HTTP_PROXY=https://127.0.0.1:3129
+#   export NO_PROXY=169.254.169.254
+#   export OBS_CA_BUNDLE=/path/to/proxy-cert.pem
+#   obsutil cp obs://bucket/key ./local \
+#     --endpoint-url http://obs.cn-north-4.myhuaweicloud.com
+# ==============================================================================
+
+# ==============================================================================
+# Download Bandwidth QoS (default: disabled)
+#
+# Limits the aggregate bytes/s the proxy pulls from S3 on cache misses and
+# divides that budget fairly across callers (User-Agent app-id) or buckets.
+# Cache hits are never throttled.  All fields have serde defaults — omitting
+# this section leaves the feature disabled.
+#
+# See docs/BANDWIDTH_QOS.md for the full tuning guide.
+# ==============================================================================
+download_bandwidth:
+  # Aggregate cache-miss download ceiling in bytes/s.  0 = unlimited (default).
+  # Example: 500000000 = 500 MB/s
+  max_bytes_per_sec: 0
+
+  # Caller-identity fairness key (off by default — bucket is the fairness key).
+  caller_id:
+    # When true, extract `app/<value>` from the User-Agent header as the key.
+    # Clients use the SDK User-Agent app-id mechanism (e.g., `sdk_ua_app_id` in
+    # OBS SDK config, or the equivalent environment variable) to append
+    # `app/<value>` to the UA string.  The proxy does not interpret the
+    # value — any per-UID or per-application convention is the operator's choice.
+    enabled: false
+    # Optional regex to validate the caller value.  Non-matching values fall back
+    # to the bucket key.  Compiled once at startup; an invalid regex is fatal.
+    # validation_regex: "^[a-z0-9_-]{1,32}$"
+    # Maximum character length for the caller value (default: 64).
+    max_len: 64
+
+  # Maximum number of distinct fairness-class metric series retained (top-K cap).
+  # Classes outside the top-K fold into a single "residual" series; they are still
+  # throttled and counted toward the ceiling.
+  max_tracked_classes: 1024
+
+  # Fleet sharing: per-instance ceiling = max_bytes_per_sec / live_instance_count.
+  # Only relevant for multi-instance deployments with shared storage.
+  fleet:
+    # Instance count used when shared storage is unavailable.
+    # IMPORTANT: set this to your fleet size on a fleet deployment so the proxy
+    # throttles safely (not unlimitedly) if the live-count read fails.
+    fallback_instance_count: 1
+    # How long a heartbeat file must be fresh to count toward the live instance
+    # count N.  Instances that haven't touched their heartbeat within this window
+    # are treated as stopped.
+    instance_staleness: "30s"
+    # How often the proxy reads the qos/heartbeats/ directory and updates the ceiling.
+    # Floor: 10s.  Values below 10s are clamped to 10s.
+    refresh_interval: "30s"
