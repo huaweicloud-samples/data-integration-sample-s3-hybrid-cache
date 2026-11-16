@@ -1,0 +1,3167 @@
+//! Dashboard Module
+//!
+//! Provides a web-based dashboard interface for monitoring Hybrid Cache for Amazon S3 performance and viewing application logs.
+
+use crate::cache::CacheManager;
+use crate::config::DashboardConfig;
+use crate::logging::LoggerManager;
+use crate::metrics::MetricsManager;
+use crate::shutdown::ShutdownSignal;
+use crate::{ProxyError, Result};
+use chrono::{DateTime, Utc};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::rt::TokioIo;
+use regex;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::SystemTime;
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, error, info, warn};
+
+/// Connection guard to automatically decrement connection counter when dropped
+struct ConnectionGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConnectionGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Dashboard server for web-based monitoring interface
+#[derive(Clone)]
+pub struct DashboardServer {
+    config: Arc<DashboardConfig>,
+    logger_manager: Option<Arc<Mutex<LoggerManager>>>,
+    static_handler: Arc<StaticFileHandler>,
+    api_handler: Arc<ApiHandler>,
+}
+
+impl DashboardServer {
+    /// Create new dashboard server
+    pub fn new(config: Arc<DashboardConfig>, app_log_dir: PathBuf) -> Self {
+        let log_reader = Arc::new(LogReader::new(
+            app_log_dir,
+            gethostname::gethostname().to_string_lossy().to_string(),
+        ));
+
+        let static_handler = Arc::new(StaticFileHandler::new());
+        let api_handler = Arc::new(ApiHandler::new(log_reader, config.clone()));
+
+        Self {
+            config,
+            logger_manager: None,
+            static_handler,
+            api_handler,
+        }
+    }
+
+    /// Set cache manager reference
+    pub async fn set_cache_manager(&self, cache_manager: Arc<CacheManager>) {
+        self.api_handler.set_cache_manager(cache_manager).await;
+    }
+
+    /// Set metrics manager reference
+    pub async fn set_metrics_manager(&self, metrics_manager: Arc<RwLock<MetricsManager>>) {
+        self.api_handler.set_metrics_manager(metrics_manager).await;
+    }
+
+    /// Set active connections counter for dashboard display
+    pub async fn set_active_connections(
+        &self,
+        active_connections: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent_requests: usize,
+    ) {
+        self.api_handler
+            .set_active_connections(active_connections, max_concurrent_requests)
+            .await;
+    }
+
+    /// Set logger manager reference
+    pub fn set_logger_manager(&mut self, logger_manager: Arc<Mutex<LoggerManager>>) {
+        self.logger_manager = Some(logger_manager);
+    }
+
+    /// Start the dashboard server
+    pub async fn start(&self, mut shutdown_signal: ShutdownSignal) -> Result<()> {
+        let addr = SocketAddr::new(
+            self.config.bind_address.parse().map_err(|e| {
+                ProxyError::ConfigError(format!("Invalid dashboard bind address: {}", e))
+            })?,
+            self.config.port,
+        );
+
+        let listener = TcpListener::bind(addr).await.map_err(|e| {
+            ProxyError::IoError(format!(
+                "Failed to bind dashboard server to {}: {}",
+                addr, e
+            ))
+        })?;
+
+        info!("Dashboard server listening on {}", addr);
+        info!(
+            "Dashboard configuration: cache_refresh={}s, logs_refresh={}s, max_log_entries={}",
+            self.config.cache_stats_refresh_interval.as_secs(),
+            self.config.logs_refresh_interval.as_secs(),
+            self.config.max_log_entries
+        );
+
+        // Track active connections for graceful shutdown
+        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_connections = 50; // Limit concurrent connections to prevent resource exhaustion
+
+        loop {
+            tokio::select! {
+                // Handle incoming connections
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, remote_addr)) => {
+                            // Check connection limit
+                            let current_connections = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                            if current_connections >= max_connections {
+                                warn!("Dashboard connection limit reached ({}), rejecting connection from {}",
+                                       max_connections, remote_addr);
+                                // Close the stream immediately
+                                drop(stream);
+                                continue;
+                            }
+
+                            debug!("Dashboard accepting connection from {}", remote_addr);
+
+                            let io = TokioIo::new(stream);
+                            let server_clone = self.clone_for_request();
+                            let connections_counter = active_connections.clone();
+
+                            // Increment connection counter
+                            connections_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            tokio::spawn(async move {
+                                let _connection_guard = ConnectionGuard::new(connections_counter);
+
+                                let service = service_fn(move |req| {
+                                    let server = server_clone.clone();
+                                    async move {
+                                        // Add timeout to prevent hanging connections
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(30),
+                                            server.handle_request(req)
+                                        ).await {
+                                            Ok(result) => result,
+                                            Err(_) => {
+                                                error!("Dashboard request timed out after 30 seconds");
+                                                Ok(Response::builder()
+                                                    .status(StatusCode::REQUEST_TIMEOUT)
+                                                    .header("Content-Type", "text/plain")
+                                                    .body("Request timeout".to_string())
+                                                    .unwrap_or_else(|_| Response::new("Timeout".to_string())))
+                                            }
+                                        }
+                                    }
+                                });
+
+                                // Configure HTTP connection with timeouts
+                                let mut builder = http1::Builder::new();
+                                builder.keep_alive(true);
+                                builder.max_buf_size(64 * 1024); // 64KB max buffer
+
+                                if let Err(e) = builder.serve_connection(io, service).await {
+                                    // Only log non-graceful shutdown errors
+                                    if !e.to_string().contains("connection closed") {
+                                        error!("Error serving dashboard connection: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept dashboard connection: {}", e);
+                            // Add small delay to prevent tight error loops
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+                // Handle shutdown signal
+                _ = shutdown_signal.wait_for_shutdown() => {
+                    info!("Dashboard server received shutdown signal");
+                    break;
+                }
+            }
+        }
+
+        // Wait for active connections to finish (with timeout)
+        let shutdown_timeout = std::time::Duration::from_secs(5);
+        let start_time = std::time::Instant::now();
+
+        while active_connections.load(std::sync::atomic::Ordering::Relaxed) > 0
+            && start_time.elapsed() < shutdown_timeout
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let remaining_connections = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+        if remaining_connections > 0 {
+            info!(
+                "Dashboard server shutdown with {} active connections remaining",
+                remaining_connections
+            );
+        } else {
+            info!("Dashboard server shutdown complete - all connections closed gracefully");
+        }
+
+        Ok(())
+    }
+
+    /// Clone server state for request handling
+    fn clone_for_request(&self) -> DashboardServerClone {
+        DashboardServerClone {
+            static_handler: self.static_handler.clone(),
+            api_handler: self.api_handler.clone(),
+        }
+    }
+}
+
+/// Cloneable version of dashboard server for request handling
+#[derive(Clone)]
+struct DashboardServerClone {
+    static_handler: Arc<StaticFileHandler>,
+    api_handler: Arc<ApiHandler>,
+}
+
+impl DashboardServerClone {
+    async fn handle_request(
+        &self,
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<String>> {
+        let method = req.method();
+        let uri = req.uri();
+        let path = uri.path();
+
+        debug!("Dashboard request: {} {}", method, path);
+
+        // Only allow GET requests
+        if method != Method::GET {
+            return Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("Allow", "GET")
+                .body("Method Not Allowed".to_string())
+                .map_err(|e| ProxyError::HttpError(format!("Failed to build response: {}", e)));
+        }
+
+        match path {
+            // API endpoints
+            "/api/cache-stats" => self.api_handler.get_cache_stats().await,
+            "/api/bucket-stats" => self.api_handler.get_bucket_stats().await,
+            "/api/bucket-traffic" => self.api_handler.get_bucket_traffic().await,
+            "/api/bandwidth" => self.api_handler.get_bandwidth_metrics().await,
+            "/api/system-info" => self.api_handler.get_system_info().await,
+            "/api/logs" => {
+                let params = parse_log_query_params(uri);
+                // Validate parameters and return 400 for invalid ones
+                if let Some(validation_error) = validate_log_params(&params) {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Content-Type", "application/json")
+                        .header("Cache-Control", "no-cache")
+                        .body(format!(
+                            r#"{{"error": "Invalid parameters", "code": 400, "message": "{}"}}"#,
+                            validation_error.replace('"', "\\\"")
+                        ))
+                        .map_err(|e| {
+                            error!("Failed to build validation error response: {}", e);
+                            ProxyError::HttpError(format!("Failed to build error response: {}", e))
+                        });
+                }
+                self.api_handler.get_logs(params).await
+            }
+            // Static files
+            "/" | "/index.html" => {
+                self.static_handler
+                    .handle_static_request("/index.html")
+                    .await
+            }
+            "/style.css" => {
+                self.static_handler
+                    .handle_static_request("/style.css")
+                    .await
+            }
+            "/script.js" => {
+                self.static_handler
+                    .handle_static_request("/script.js")
+                    .await
+            }
+            // 404 for everything else
+            _ => Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "text/plain")
+                .body("Not Found".to_string())
+                .map_err(|e| {
+                    ProxyError::HttpError(format!("Failed to build 404 response: {}", e))
+                })?),
+        }
+    }
+}
+
+/// Static file handler for embedded HTML, CSS, and JavaScript
+pub struct StaticFileHandler {
+    // Static files are embedded in the binary
+}
+
+impl Default for StaticFileHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StaticFileHandler {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub async fn handle_static_request(&self, path: &str) -> Result<Response<String>> {
+        let (content, content_type) = match path {
+            "/index.html" => (self.get_index_html(), "text/html"),
+            "/style.css" => (self.get_style_css(), "text/css"),
+            "/script.js" => (self.get_script_js(), "application/javascript"),
+            _ => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("Content-Type", "text/plain")
+                    .body("Static file not found".to_string())
+                    .map_err(|e| {
+                        ProxyError::HttpError(format!("Failed to build 404 response: {}", e))
+                    });
+            }
+        };
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .header("Cache-Control", "no-cache")
+            .body(content)
+            .map_err(|e| {
+                ProxyError::HttpError(format!("Failed to build static file response: {}", e))
+            })
+    }
+
+    pub fn get_index_html(&self) -> String {
+        // Minimal HTML dashboard interface
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hybrid Cache for Amazon S3</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header>
+        <h1>Hybrid Cache for Amazon S3</h1>
+        <div id="system-info">
+            <span id="hostname">Loading...</span> | 
+            <span id="version">Loading...</span> | 
+            <span id="uptime">Loading...</span> |
+            <span id="active-requests">Loading...</span>
+        </div>
+    </header>
+    
+    <nav>
+        <button id="cache-stats-tab" class="tab-button active" onclick="showTab('cache-stats')">Cache Stats</button>
+        <button id="logs-tab" class="tab-button" onclick="showTab('logs')">Application Logs</button>
+    </nav>
+    
+    <main>
+        <div id="cache-stats" class="tab-content active">
+            <div id="cache-stats-content">Loading...</div>
+            <div id="bucket-stats-section" style="display:none;">
+                <h2>Cache Rules</h2>
+                <div class="bucket-stats-controls">
+                    <input type="text" id="bucket-filter" placeholder="Filter by pattern..." />
+                    <span id="bucket-stats-toggle"></span>
+                </div>
+                <div class="bucket-stats-table">
+                    <table id="bucket-stats-table">
+                        <thead>
+                            <tr>
+                                <th>Rule / Pattern</th>
+                                <th>HEAD</th>
+                                <th>GET</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="bucket-stats-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="bucket-traffic-section" style="display:none; margin-top:2rem;">
+                <h2 id="bucket-traffic-title">Per-Bucket Traffic</h2>
+                <div class="bucket-stats-controls">
+                    <input type="text" id="bucket-traffic-filter" placeholder="Filter by bucket..." />
+                    <span id="bucket-traffic-toggle"></span>
+                </div>
+                <div class="bucket-stats-table">
+                    <table id="bucket-traffic-table">
+                        <thead>
+                            <tr>
+                                <th>Bucket</th>
+                                <th>Get</th>
+                                <th>Put</th>
+                                <th title="Bytes sent to the client for GET requests (cache + S3 fetch). Mirrors S3 BytesDownloaded.">Bytes Downloaded</th>
+                                <th title="Bytes served from cache, not fetched from S3 (GET cache hits only).">S3 Transfer Saved</th>
+                                <th title="Bytes received from the client for PUT/multipart requests. Mirrors S3 BytesUploaded.">Bytes Uploaded</th>
+                            </tr>
+                        </thead>
+                        <tbody id="bucket-traffic-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <div id="logs" class="tab-content">
+            <div class="logs-controls">
+                <label for="log-level-filter">Level:</label>
+                <select id="log-level-filter">
+                    <option value="">All</option>
+                    <option value="ERROR">ERROR</option>
+                    <option value="WARN">WARN</option>
+                    <option value="INFO">INFO</option>
+                    <option value="DEBUG">DEBUG</option>
+                </select>
+                
+                <label for="log-text-filter">Filter:</label>
+                <input type="text" id="log-text-filter" placeholder="Search logs..." style="width: 200px;">
+                
+                <label for="log-limit">Entries:</label>
+                <select id="log-limit">
+                    <option value="50">50</option>
+                    <option value="100" selected>100</option>
+                    <option value="200">200</option>
+                    <option value="500">500</option>
+                </select>
+                
+                <button id="refresh-logs" onclick="refreshLogs()">Refresh</button>
+            </div>
+            <div id="logs-content">Loading...</div>
+        </div>
+    </main>
+    
+    <script src="/script.js"></script>
+</body>
+</html>"#.to_string()
+    }
+
+    pub fn get_style_css(&self) -> String {
+        // Minimal, responsive CSS for dashboard layout
+        r#"* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    line-height: 1.6;
+    color: #333;
+    background-color: #f5f5f5;
+}
+
+header {
+    background: #2c3e50;
+    color: white;
+    padding: 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+header h1 {
+    font-size: 1.5rem;
+}
+
+#system-info {
+    font-size: 0.9rem;
+    opacity: 0.9;
+}
+
+nav {
+    background: #34495e;
+    padding: 0;
+    display: flex;
+}
+
+.tab-button {
+    background: none;
+    border: none;
+    color: white;
+    padding: 1rem 2rem;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.tab-button:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.tab-button.active {
+    background-color: #3498db;
+}
+
+main {
+    padding: 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.tab-content {
+    display: none;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+.tab-content h2 {
+    margin-bottom: 1rem;
+    color: #2c3e50;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+}
+
+.stat-card {
+    background: white;
+    padding: 1.5rem;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.stat-card h3 {
+    color: #2c3e50;
+    margin-bottom: 0.25rem;
+    font-size: 1.1rem;
+}
+
+.stat-subtitle {
+    color: #7f8c8d;
+    font-size: 0.8rem;
+    margin-bottom: 1rem;
+}
+
+.stat-item {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.stat-item .stat-label {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+
+.stat-item .help-icon {
+    cursor: pointer;
+    color: #95a5a6;
+    font-size: 0.75rem;
+    user-select: none;
+    line-height: 1;
+}
+
+.stat-item .help-icon:hover {
+    color: #3498db;
+}
+
+.stat-item .help-text {
+    display: none;
+    width: 100%;
+    font-size: 0.78rem;
+    color: #6c757d;
+    padding: 0.2rem 0 0.1rem 1.2rem;
+    line-height: 1.3;
+}
+
+.stat-item .help-text.visible {
+    display: block;
+}
+
+.stat-item.warning {
+    background-color: #fff3cd;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    margin-left: -0.5rem;
+    margin-right: -0.5rem;
+}
+
+.stat-value {
+    font-weight: bold;
+    color: #27ae60;
+}
+
+.stat-value.warning-value {
+    color: #e67e22;
+}
+
+.logs-controls {
+    background: white;
+    padding: 1rem;
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.logs-controls label {
+    font-weight: bold;
+}
+
+.logs-controls select, .logs-controls button, .logs-controls input[type="text"] {
+    padding: 0.5rem;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+
+.logs-controls input[type="text"] {
+    min-width: 150px;
+}
+
+.logs-controls input[type="text"]:focus {
+    outline: none;
+    border-color: #3498db;
+    box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.2);
+}
+
+.logs-controls button {
+    background: #3498db;
+    color: white;
+    cursor: pointer;
+}
+
+.logs-controls button:hover {
+    background: #2980b9;
+}
+
+.logs-table {
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.logs-table table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+
+/* Fixed widths for the first three columns; message column takes the rest */
+.logs-table th:nth-child(1), .logs-table td:nth-child(1) { width: 140px; }
+.logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 72px; }
+.logs-table th:nth-child(3), .logs-table td:nth-child(3) { width: 240px; }
+
+.logs-table th {
+    background: #34495e;
+    color: white;
+    padding: 1rem;
+    text-align: left;
+}
+
+.logs-table td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #eee;
+}
+
+.log-message {
+    overflow-x: auto;
+    white-space: nowrap;
+    padding-bottom: 4px; /* room for the scrollbar track */
+}
+
+/* Persistent, easy-to-click scrollbar on the message column */
+.log-message::-webkit-scrollbar {
+    height: 8px;
+}
+.log-message::-webkit-scrollbar-track {
+    background: #f0f0f0;
+    border-radius: 4px;
+}
+.log-message::-webkit-scrollbar-thumb {
+    background: #aaa;
+    border-radius: 4px;
+}
+.log-message::-webkit-scrollbar-thumb:hover {
+    background: #777;
+}
+
+.logs-table tr:hover {
+    background-color: #f8f9fa;
+}
+
+.log-level {
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-weight: bold;
+}
+
+.log-level.ERROR {
+    background: #e74c3c;
+    color: white;
+}
+
+.log-level.WARN {
+    background: #f39c12;
+    color: white;
+}
+
+.log-level.INFO {
+    background: #3498db;
+    color: white;
+}
+
+.log-level.DEBUG {
+    background: #95a5a6;
+    color: white;
+}
+
+.loading {
+    text-align: center;
+    padding: 2rem;
+    color: #7f8c8d;
+}
+
+.error {
+    background: #e74c3c;
+    color: white;
+    padding: 1rem;
+    border-radius: 4px;
+    margin: 1rem 0;
+}
+
+#bucket-stats-section {
+    margin-top: 2rem;
+}
+
+/* Flow chart layout for HEAD/GET request paths */
+.flow-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 1.5rem;
+    row-gap: 0;
+    margin-bottom: 1.5rem;
+    align-items: start;
+}
+
+.flow-header {
+    text-align: center;
+    color: #2c3e50;
+    margin: 0 0 0.75rem 0;
+    font-size: 1.1rem;
+    align-self: end;
+}
+
+.flow-summary {
+    margin-bottom: 0.5rem;
+    padding: 0.5rem 1rem;
+    background: #e8f4f8;
+    border-radius: 6px;
+    border: 1px solid #bee5eb;
+    align-self: stretch;
+}
+
+.flow-card {
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    align-self: stretch;
+}
+
+.flow-card h4 {
+    margin: 0 0 0.5rem 0;
+    color: #495057;
+    font-size: 0.9rem;
+    border-bottom: 1px solid #dee2e6;
+    padding-bottom: 0.4rem;
+}
+
+.flow-card-s3 {
+    background: #fff3cd;
+    border-color: #ffc107;
+}
+
+.flow-arrow {
+    text-align: center;
+    color: #6c757d;
+    font-size: 0.8rem;
+    padding: 0.25rem 0;
+    align-self: center;
+}
+
+.overall-card {
+    max-width: 100%;
+}
+
+#bucket-stats-section h2 {
+    margin-bottom: 1rem;
+    color: #2c3e50;
+}
+
+.bucket-stats-controls {
+    background: white;
+    padding: 1rem;
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.bucket-stats-controls input[type="text"] {
+    padding: 0.5rem;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    min-width: 200px;
+}
+
+.bucket-stats-controls input[type="text"]:focus {
+    outline: none;
+    border-color: #3498db;
+    box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.2);
+}
+
+#bucket-stats-toggle a {
+    color: #3498db;
+    cursor: pointer;
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+#bucket-stats-toggle a:hover {
+    text-decoration: underline;
+}
+
+.bucket-stats-table {
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.bucket-stats-table table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.bucket-stats-table th {
+    background: #34495e;
+    color: white;
+    padding: 0.75rem 1rem;
+    text-align: left;
+    white-space: nowrap;
+    user-select: none;
+}
+
+.bucket-stats-table td {
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid #eee;
+}
+
+.bucket-stats-table tr.bucket-row {
+    font-weight: 500;
+}
+
+.bucket-stats-table tr.bucket-row:hover,
+.bucket-stats-table tr.prefix-row:hover {
+    background-color: #f0f7ff;
+}
+
+.bucket-stats-table tr.prefix-row td:first-child {
+    color: #95a5a6;
+}
+
+.bucket-stats-table tr.stats-detail-row {
+    background-color: #f8f9fa;
+}
+
+.bucket-stats-table tr.stats-detail-row td {
+    padding: 0.5rem 1rem;
+}
+
+.stats-detail {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.85rem;
+    color: #495057;
+}
+
+.stats-btn {
+    background: #e8f4f8;
+    border: 1px solid #bee5eb;
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    color: #495057;
+}
+
+.stats-btn:hover {
+    background: #d1ecf1;
+}
+
+.detail-sep {
+    color: #dee2e6;
+    margin: 0 0.25rem;
+}
+
+.badge-on {
+    color: #27ae60;
+    font-weight: 500;
+}
+
+.badge-off {
+    color: #95a5a6;
+}
+
+.detail-content {
+    font-size: 0.9rem;
+}
+
+.detail-content h4 {
+    margin: 0 0 0.5rem 0;
+    color: #2c3e50;
+    font-size: 0.95rem;
+}
+
+.detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 0.4rem 1.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.detail-grid .detail-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.detail-grid .detail-label {
+    color: #7f8c8d;
+}
+
+.detail-grid .detail-value {
+    font-weight: bold;
+}
+
+.prefix-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+}
+
+.prefix-table th {
+    background: #ecf0f1;
+    color: #2c3e50;
+    padding: 0.4rem 0.6rem;
+    text-align: left;
+    font-weight: 600;
+}
+
+.prefix-table td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid #eee;
+}
+
+.badge-on {
+    color: #27ae60;
+    font-weight: bold;
+}
+
+.badge-off {
+    color: #e74c3c;
+    font-weight: bold;
+}
+
+@media (max-width: 768px) {
+    header {
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+    
+    nav {
+        flex-direction: column;
+    }
+    
+    .logs-controls {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    
+    .logs-table {
+        overflow-x: auto;
+    }
+
+    .bucket-stats-controls {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .bucket-stats-table {
+        overflow-x: auto;
+    }
+}
+
+.overflow-badge {
+    display: inline-block;
+    background: #f39c12;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: bold;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+}
+
+.overflow-suffix {
+    color: #e67e22;
+    font-style: italic;
+    font-size: 0.85em;
+    margin-left: 0.3rem;
+}"#
+        .to_string()
+    }
+
+    pub fn get_script_js(&self) -> String {
+        // JavaScript for dashboard functionality
+        r#"let currentTab = 'cache-stats';
+let cacheStatsInterval;
+let logsInterval;
+let cacheStatsRefreshMs = 5000;  // Default, overridden by server config
+let logsRefreshMs = 10000;       // Default, overridden by server config
+
+// Initialize dashboard
+document.addEventListener('DOMContentLoaded', function() {
+    showTab('cache-stats');
+    loadSystemInfo().then(() => startAutoRefresh());
+});
+
+function showTab(tabName) {
+    // Hide all tab contents
+    document.querySelectorAll('.tab-content').forEach(content => {
+        content.classList.remove('active');
+    });
+    
+    // Remove active class from all tab buttons
+    document.querySelectorAll('.tab-button').forEach(button => {
+        button.classList.remove('active');
+    });
+    
+    // Show selected tab content
+    document.getElementById(tabName).classList.add('active');
+    document.getElementById(tabName + '-tab').classList.add('active');
+    
+    currentTab = tabName;
+    
+    // Load content for the selected tab
+    if (tabName === 'cache-stats') {
+        loadCacheStats();
+    } else if (tabName === 'logs') {
+        loadLogs();
+    }
+}
+
+function startAutoRefresh() {
+    // Clear existing intervals
+    if (cacheStatsInterval) clearInterval(cacheStatsInterval);
+    if (logsInterval) clearInterval(logsInterval);
+    
+    // Auto-refresh cache stats using server-configured interval
+    cacheStatsInterval = setInterval(() => {
+        if (currentTab === 'cache-stats') {
+            loadCacheStats();
+        }
+        // Always refresh system info (uptime) regardless of tab
+        loadSystemInfo();
+    }, cacheStatsRefreshMs);
+    
+    // Auto-refresh logs using server-configured interval
+    logsInterval = setInterval(() => {
+        if (currentTab === 'logs') {
+            loadLogs();
+        }
+    }, logsRefreshMs);
+}
+
+async function loadSystemInfo() {
+    try {
+        const response = await fetch('/api/system-info');
+        const data = await response.json();
+        
+        document.getElementById('hostname').textContent = 'Host: ' + (data.hostname || 'Unknown');
+        document.getElementById('version').textContent = 'Version: ' + (data.version || 'Unknown');
+        
+        if (data.uptime_seconds) {
+            const uptime = formatUptime(data.uptime_seconds);
+            document.getElementById('uptime').textContent = 'Uptime: ' + uptime;
+        }
+
+        // Update requests display. Paired with permits_held (request-concurrency
+        // permits), not active_requests (a TCP connection count) — the numerator
+        // and denominator must share units. active_requests is shown separately
+        // as a connections figure so the connection count is still visible.
+        if (data.max_concurrent_requests > 0) {
+            document.getElementById('active-requests').textContent = 'Requests: ' + data.permits_held + ' / ' + data.max_concurrent_requests + ' (connections: ' + data.active_requests + ')';
+        }
+
+        // Apply server-configured refresh intervals (only on first load)
+        if (data.cache_stats_refresh_ms && data.cache_stats_refresh_ms > 0) {
+            cacheStatsRefreshMs = data.cache_stats_refresh_ms;
+        }
+        if (data.logs_refresh_ms && data.logs_refresh_ms > 0) {
+            logsRefreshMs = data.logs_refresh_ms;
+        }
+    } catch (error) {
+        console.error('Failed to load system info:', error);
+        // Fallback to cache stats API for system info
+        try {
+            const response = await fetch('/api/cache-stats');
+            const data = await response.json();
+            
+            document.getElementById('hostname').textContent = 'Host: ' + (data.hostname || 'Unknown');
+            document.getElementById('version').textContent = 'Version: ' + (data.version || 'Unknown');
+            
+            if (data.overall && data.overall.uptime_seconds) {
+                const uptime = formatUptime(data.overall.uptime_seconds);
+                document.getElementById('uptime').textContent = 'Uptime: ' + uptime;
+            }
+        } catch (fallbackError) {
+            console.error('Failed to load system info from fallback:', fallbackError);
+        }
+    }
+}
+
+async function loadCacheStats() {
+    const content = document.getElementById('cache-stats-content');
+    
+    try {
+        const response = await fetch('/api/cache-stats');
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        const data = await response.json();
+        helpCounter = 0; // Reset so IDs are stable across refreshes
+        content.innerHTML = renderCacheStats(data);
+    } catch (error) {
+        content.innerHTML = `<div class="error">Failed to load cache statistics: ${error.message}</div>`;
+    }
+    
+    loadBucketStats();
+    loadBucketTraffic();
+}
+
+async function loadLogs() {
+    const content = document.getElementById('logs-content');
+    const levelFilter = document.getElementById('log-level-filter').value;
+    const textFilter = document.getElementById('log-text-filter').value.trim();
+    const limit = document.getElementById('log-limit').value;
+    
+    try {
+        let url = '/api/logs?limit=' + limit;
+        if (levelFilter) {
+            url += '&level=' + levelFilter;
+        }
+        if (textFilter) {
+            url += '&text=' + encodeURIComponent(textFilter);
+        }
+        
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        const data = await response.json();
+        // Store data for rendering
+        window.lastLogsData = data;
+        content.innerHTML = renderLogs(data);
+    } catch (error) {
+        content.innerHTML = `<div class="error">Failed to load logs: ${error.message}</div>`;
+    }
+}
+
+function refreshLogs() {
+    loadLogs();
+}
+
+function renderCacheStats(data) {
+    if (!data) {
+        return '<div class="loading">No cache statistics available</div>';
+    }
+    
+    // Conditional displays
+    const staleRefreshes = data.metadata_cache?.stale_refreshes || 0;
+    const staleRefreshesDisplay = staleRefreshes > 0 
+        ? stat('Stale Refreshes', formatNumber(staleRefreshes),
+            'RAM entries that expired and required a disk re-read. These count as RAM misses but may still be disk hits.')
+        : '';
+    const staleHandleDisplay = (data.metadata_cache?.stale_handle_errors || 0) > 0 
+        ? statWarn('Stale Handle Errors', formatNumber(data.metadata_cache?.stale_handle_errors || 0),
+            'File handle errors when reading metadata from shared storage (NFS/EFS). Indicates stale NFS file handles that required retry.')
+        : '';
+    const lastConsolidationDisplay = data.last_consolidation 
+        ? stat('Last Consolidation', formatTimestamp(data.last_consolidation),
+            'When the journal consolidator last processed pending journal entries and updated cache size tracking.')
+        : '';
+
+    // HEAD flow metrics
+    const headRamHits = data.metadata_cache?.head_hits || 0;
+    const headDiskHits = data.metadata_cache?.head_disk_hits || 0;
+    // headRamMisses = HEAD requests that reached disk (head_disk_hits + HEAD S3 fetches)
+    const headRamMisses = data.metadata_cache?.head_misses || 0;
+    const headS3Fetches = headRamMisses - headDiskHits;
+    const headTotal = headRamHits + headRamMisses;
+    const headOverallHitRate = headTotal > 0 ? ((headRamHits + headDiskHits) / headTotal * 100).toFixed(1) : '0.0';
+    const headRamHitRate = headTotal > 0 ? (headRamHits / headTotal * 100).toFixed(1) : '0.0';
+    const headDiskHitRate = headRamMisses > 0 ? (headDiskHits / headRamMisses * 100).toFixed(1) : '0.0';
+
+    // GET flow metrics
+    const getRamHits = data.ram_cache?.hits || 0;
+    const getRamMisses = data.ram_cache?.misses || 0;
+    const getDiskHits = data.disk_cache?.hits || 0;
+    const getDiskMisses = data.disk_cache?.misses || 0;
+    const getTotal = data.overall?.get_total || (getRamHits + getDiskHits + getDiskMisses);
+    const getOverallHitRate = getTotal > 0 ? ((getRamHits + getDiskHits) / getTotal * 100).toFixed(1) : '0.0';
+    const getRamHitRate = (data.ram_cache?.hit_rate || 0).toFixed(1);
+    const getDiskTotal = getDiskHits + getDiskMisses;
+    const getDiskHitRate = getDiskTotal > 0 ? (getDiskHits / getDiskTotal * 100).toFixed(1) : '0.0';
+
+    return `
+        <div class="flow-layout">
+            <h3 class="flow-header">HEAD Requests</h3>
+            <h3 class="flow-header">GET Requests</h3>
+
+            <div class="flow-summary">
+                ${stat('Total', formatNumber(headTotal), 'Total HEAD requests processed.')}
+                ${stat('Overall Hit Rate', headOverallHitRate + '%', 'Percentage of HEAD requests served from any cache tier without S3 fetch.')}
+            </div>
+            <div class="flow-summary">
+                ${stat('Total', formatNumber(getTotal), 'Total GET requests processed.')}
+                ${stat('Overall Hit Rate', getOverallHitRate + '%', 'Percentage of GET requests served from any cache tier without S3 fetch.')}
+            </div>
+
+            <div class="flow-card">
+                <h4>RAM Metadata</h4>
+                ${stat('Hit Rate', headRamHitRate + '%', 'Percentage of HEAD metadata lookups served from RAM without disk I/O.')}
+                ${stat('Hits', formatNumber(headRamHits), 'HEAD metadata lookups served from RAM.')}
+                ${stat('Misses', formatNumber(headRamMisses), 'HEAD metadata lookups not found in RAM (falls through to disk).')}
+                ${stat('Entries', formatNumber(data.metadata_cache?.entries || 0) + ' / ' + formatNumber(data.metadata_cache?.max_entries || 0), 'Metadata entries currently held in RAM vs configured maximum.')}
+                ${stat('Evictions', formatNumber(data.metadata_cache?.evictions || 0), 'Metadata entries evicted from RAM when at capacity (LRU).')}
+                ${staleRefreshesDisplay}
+                ${staleHandleDisplay}
+            </div>
+            <div class="flow-card">
+                <h4>RAM Range Cache</h4>
+                ${stat('Hit Rate', getRamHitRate + '%', 'Percentage of GET range lookups served from RAM without disk I/O.')}
+                ${stat('Hits', formatNumber(getRamHits), 'GET requests served from RAM range cache.')}
+                ${stat('Misses', formatNumber(getRamMisses), 'GET requests not found in RAM (falls through to disk).')}
+                ${stat('Size', (data.ram_cache?.size_human || '0 B') + (data.ram_cache?.max_size_human ? ' / ' + data.ram_cache.max_size_human : ''), 'Current RAM range cache usage vs configured maximum.')}
+                ${stat('Evictions', formatNumber(data.ram_cache?.evictions || 0), 'Range entries evicted from RAM to make room for new data.')}
+            </div>
+
+            <div class="flow-arrow">▼ miss</div>
+            <div class="flow-arrow">▼ miss</div>
+
+            <div class="flow-card">
+                <h4>Disk Metadata</h4>
+                ${stat('Hit Rate', headDiskHitRate + '%', 'Percentage of disk metadata lookups that found unexpired .meta files.')}
+                ${stat('Hits', formatNumber(headDiskHits), 'HEAD lookups served from unexpired .meta files on disk.')}
+            </div>
+            <div class="flow-card">
+                <h4>Disk Range Cache</h4>
+                ${stat('Hit Rate', getDiskHitRate + '%', 'Percentage of disk range lookups that found cached data.')}
+                ${stat('Hits', formatNumber(getDiskHits), 'GET requests served from cached range data on disk.')}
+                ${stat('Evictions', formatNumber(data.disk_cache?.evictions || 0), 'Cached ranges removed during eviction to free disk space.')}
+            </div>
+
+            <div class="flow-arrow">▼ miss</div>
+            <div class="flow-arrow">▼ miss</div>
+
+            <div class="flow-card flow-card-s3">
+                ${stat('S3 Fetch', formatNumber(headS3Fetches), 'HEAD requests forwarded to S3 because no cached metadata was found on RAM or disk.')}
+            </div>
+            <div class="flow-card flow-card-s3">
+                ${stat('S3 Fetch', formatNumber(getDiskMisses), 'GET requests forwarded to S3 because no cached range data was found on RAM or disk.')}
+            </div>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card overall-card">
+                <h3>Overall Statistics</h3>
+                ${stat('Total Requests', formatNumber(data.overall?.total_requests || 0), 'Total HTTP requests processed (GET + HEAD + PUT).')}
+                ${stat('Cached Objects', data.disk_cache?.cached_objects != null ? formatNumber(data.disk_cache.cached_objects) : 'N/A', 'Number of distinct S3 objects currently stored on disk.')}
+                ${stat('Total Cache Size', (data.disk_cache?.size_human || '0 B') + (data.disk_cache?.max_size_human ? ' / ' + data.disk_cache.max_size_human : ''), 'Total disk cache usage (read + write cache) vs configured maximum.')}
+                ${stat('Write Cache', (data.write_cache?.size_human || '0 B') + ' / ' + (data.write_cache?.max_size_human || '0 B'), 'Disk space used by MPUs in progress and PUT objects not yet read via GET.')}
+                ${stat('S3 Requests Saved', formatNumber(data.overall?.s3_requests_saved || 0), 'Number of S3 requests avoided by serving from cache (GET + HEAD cache hits).')}
+                ${stat('S3 Transfer Saved', data.overall?.s3_transfer_saved_human || '0 B', 'Total bytes served from cache instead of fetching from S3.')}
+                ${stat('Uptime', formatUptime(data.overall?.uptime_seconds || 0), 'Time since the proxy process started.')}
+                ${lastConsolidationDisplay}
+            </div>
+        </div>
+    `;
+}
+
+function renderLogs(data) {
+    if (!data || !data.entries || data.entries.length === 0) {
+        const textFilter = document.getElementById('log-text-filter').value.trim();
+        if (textFilter) {
+            return '<div class="loading">No log entries match the filter "' + escapeHtml(textFilter) + '"</div>';
+        }
+        return '<div class="loading">No log entries available</div>';
+    }
+    
+    const rows = data.entries.map(entry => `
+        <tr>
+            <td>${formatTimestamp(entry.timestamp)}</td>
+            <td><span class="log-level ${escapeHtml(entry.level)}">${escapeHtml(entry.level)}</span></td>
+            <td>${escapeHtml(entry.target || '')}</td>
+            <td><div class="log-message">${escapeHtml(entry.message)}</div></td>
+        </tr>
+    `).join('');
+    
+    const textFilter = document.getElementById('log-text-filter').value.trim();
+    const filterNote = textFilter ? ` (matching "${escapeHtml(textFilter)}")` : '';
+    
+    return `
+        <div class="logs-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Level</th>
+                        <th>Target</th>
+                        <th>Message</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${rows}
+                </tbody>
+            </table>
+        </div>
+        <p style="margin-top: 1rem; color: #7f8c8d;">
+            Showing ${data.entries.length} entries${filterNote}${data.has_more ? ' (more available)' : ''}
+        </p>
+    `;
+}
+
+function formatNumber(num) {
+    return num.toLocaleString();
+}
+
+function formatUptime(seconds) {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    
+    if (days > 0) {
+        return `${days}d ${hours}h ${minutes}m`;
+    } else if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    } else {
+        return `${minutes}m`;
+    }
+}
+
+function formatTimestamp(timestamp) {
+    // Handle SystemTime object format from Rust (secs_since_epoch, nanos_since_epoch)
+    if (timestamp && typeof timestamp === 'object' && timestamp.secs_since_epoch) {
+        const date = new Date(timestamp.secs_since_epoch * 1000);
+        return date.toLocaleString();
+    }
+    // Handle Unix timestamp in milliseconds
+    const date = new Date(timestamp);
+    return date.toLocaleString();
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+let expandedHelp = new Set();
+let helpCounter = 0;
+
+function stat(label, value, help) {
+    const id = 'help-' + (helpCounter++);
+    const vis = expandedHelp.has(id) ? ' visible' : '';
+    return `<div class="stat-item">
+        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${id}')">ⓘ</span></span>
+        <span class="stat-value">${value}</span>
+        <span class="help-text${vis}" id="${id}">${help}</span>
+    </div>`;
+}
+
+function statWarn(label, value, help) {
+    const id = 'help-' + (helpCounter++);
+    const vis = expandedHelp.has(id) ? ' visible' : '';
+    return `<div class="stat-item warning">
+        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${id}')">ⓘ</span></span>
+        <span class="stat-value warning-value">${value}</span>
+        <span class="help-text${vis}" id="${id}">${help}</span>
+    </div>`;
+}
+
+function toggleHelp(id) {
+    const el = document.getElementById(id);
+    if (el.classList.contains('visible')) {
+        el.classList.remove('visible');
+        expandedHelp.delete(id);
+    } else {
+        el.classList.add('visible');
+        expandedHelp.add(id);
+    }
+}
+
+// Event listeners for log controls
+document.getElementById('log-level-filter').addEventListener('change', loadLogs);
+document.getElementById('log-limit').addEventListener('change', loadLogs);
+
+// Text filter with debounce - fetches from server with filter applied
+let textFilterTimeout;
+document.getElementById('log-text-filter').addEventListener('input', function() {
+    clearTimeout(textFilterTimeout);
+    textFilterTimeout = setTimeout(loadLogs, 300);
+});
+
+// === Cache Rules Table ===
+let bucketStatsRules = [];
+let bucketShowAll = false;
+let expandedSettings = new Set(); // Track which rows have settings expanded
+const BUCKET_PAGE_SIZE = 20;
+
+async function loadBucketStats() {
+    try {
+        const response = await fetch('/api/bucket-stats');
+        if (!response.ok) return;
+        const data = await response.json();
+        const section = document.getElementById('bucket-stats-section');
+        const hasRules = data.rules && data.rules.length > 0;
+        if (!hasRules) {
+            section.style.display = 'none';
+            return;
+        }
+        section.style.display = '';
+        bucketStatsRules = data.rules || [];
+        renderBucketStats();
+    } catch (e) {
+        console.error('Failed to load bucket stats:', e);
+    }
+}
+
+function hitSummary(hits, total) {
+    if (total === 0) return '-';
+    const pct = (hits / total * 100).toFixed(1);
+    return pct + '% of ' + formatNumber(total);
+}
+
+function renderBucketStats() {
+    const filter = (document.getElementById('bucket-filter').value || '').toLowerCase();
+    let rows = [];
+    // Cache rules (ordered, first-match-per-field). Each rule is one row.
+    (bucketStatsRules || []).forEach((r, idx) => {
+        if (filter && !r.pattern.toLowerCase().includes(filter)) return;
+        rows.push({
+            rowKey: 'rule::' + idx,
+            prefix: r.pattern,
+            headHits: r.head_hit_count || 0, headTotal: (r.head_hit_count || 0) + (r.head_miss_count || 0),
+            getHits: r.get_hit_count || 0, getTotal: (r.get_hit_count || 0) + (r.get_miss_count || 0),
+            settings: r
+        });
+    });
+
+    const total = rows.length;
+    const display = bucketShowAll ? rows : rows.slice(0, BUCKET_PAGE_SIZE);
+    const toggle = document.getElementById('bucket-stats-toggle');
+    if (total > BUCKET_PAGE_SIZE) {
+        toggle.innerHTML = bucketShowAll
+            ? '<a onclick="bucketShowAll=false;renderBucketStats();">Show top ' + BUCKET_PAGE_SIZE + '</a>'
+            : '<a onclick="bucketShowAll=true;renderBucketStats();">Show all ' + total + ' rows</a>';
+    } else {
+        toggle.innerHTML = '';
+    }
+
+    const tbody = document.getElementById('bucket-stats-body');
+    tbody.innerHTML = '';
+    display.forEach(r => {
+        const tr = document.createElement('tr');
+        tr.className = 'prefix-row';
+        const settingsBtn = r.settings
+            ? '<button class="stats-btn" onclick="event.stopPropagation();toggleSettings(this,\'' + r.rowKey.replace(/'/g, "\\'") + '\')">Settings</button>'
+            : '';
+        tr.innerHTML =
+            '<td>' + escapeHtml(r.prefix) + '</td>' +
+            '<td>' + hitSummary(r.headHits, r.headTotal) + '</td>' +
+            '<td>' + hitSummary(r.getHits, r.getTotal) + '</td>' +
+            '<td>' + settingsBtn + '</td>';
+        if (r.settings) {
+            tr.dataset.settings = JSON.stringify(r.settings);
+        }
+        tbody.appendChild(tr);
+
+        // Restore expanded settings if previously open
+        if (r.settings && expandedSettings.has(r.rowKey)) {
+            appendSettingsRow(tr, r.settings, r.rowKey);
+        }
+    });
+}
+
+function appendSettingsRow(row, settings, rowKey) {
+    const s = typeof settings === 'string' ? JSON.parse(settings) : settings;
+    const detail = document.createElement('tr');
+    detail.className = 'stats-detail-row';
+    detail.dataset.rowKey = rowKey;
+    const td = document.createElement('td');
+    td.colSpan = 4;
+    const items = [];
+    if (s.get_ttl) items.push('GET TTL: ' + escapeHtml(s.get_ttl));
+    if (s.head_ttl) items.push('HEAD TTL: ' + escapeHtml(s.head_ttl));
+    if (s.put_ttl) items.push('PUT TTL: ' + escapeHtml(s.put_ttl));
+    if (s.read_cache_enabled != null) items.push('Read: ' + (s.read_cache_enabled ? 'On' : 'Off'));
+    if (s.write_cache_enabled != null) items.push('Write: ' + (s.write_cache_enabled ? 'On' : 'Off'));
+    if (s.compression_enabled != null) items.push('Compression: ' + (s.compression_enabled ? 'On' : 'Off'));
+    if (s.ram_cache_eligible != null) items.push('RAM: ' + (s.ram_cache_eligible ? 'On' : 'Off'));
+    if (s.evaluate_conditions_from_cache != null) items.push('Local conditions: ' + (s.evaluate_conditions_from_cache ? 'On' : 'Off'));
+    if (s.page_widening != null) items.push('Page widening: ' + (s.page_widening ? 'On' : 'Off'));
+    if (s.page_size != null) items.push('Page size: ' + formatBytes(s.page_size));
+    if (s.hedging_enabled != null) items.push('Hedging: ' + (s.hedging_enabled ? 'On' : 'Off'));
+    if (s.hedge_trigger_after != null) items.push('Hedge trigger: ' + escapeHtml(s.hedge_trigger_after));
+    if (s.hedge_max_per_request != null) items.push('Hedge budget: ' + s.hedge_max_per_request);
+    td.innerHTML = '<div class="stats-detail">' + items.join('<span class="detail-sep">·</span>') + '</div>';
+    detail.appendChild(td);
+    row.after(detail);
+}
+
+function toggleSettings(btn, rowKey) {
+    const row = btn.closest('tr');
+    const next = row.nextElementSibling;
+    if (next && next.classList.contains('stats-detail-row')) {
+        next.remove();
+        expandedSettings.delete(rowKey);
+        return;
+    }
+    const s = JSON.parse(row.dataset.settings);
+    expandedSettings.add(rowKey);
+    appendSettingsRow(row, s, rowKey);
+}
+
+// Bucket filter with debounce
+let bucketFilterTimeout;
+document.getElementById('bucket-filter').addEventListener('input', function() {
+    clearTimeout(bucketFilterTimeout);
+    bucketFilterTimeout = setTimeout(renderBucketStats, 200);
+});
+
+// === Per-Bucket Traffic Table ===
+let bucketTrafficData = {};
+let bucketTrafficOverflow = false;
+let bucketTrafficShowAll = false;
+const TRAFFIC_PAGE_SIZE = 20;
+
+async function loadBucketTraffic() {
+    try {
+        const response = await fetch('/api/bucket-traffic');
+        if (!response.ok) return;
+        const data = await response.json();
+        const section = document.getElementById('bucket-traffic-section');
+        if (!data.bucket_traffic || Object.keys(data.bucket_traffic).length === 0) {
+            section.style.display = 'none';
+            return;
+        }
+        section.style.display = '';
+        bucketTrafficData = data.bucket_traffic || {};
+        bucketTrafficOverflow = data.overflow_active || false;
+        renderBucketTraffic();
+    } catch (e) {
+        console.error('Failed to load bucket traffic:', e);
+    }
+}
+
+function renderBucketTraffic() {
+    // Update title with overflow badge if needed
+    const title = document.getElementById('bucket-traffic-title');
+    title.innerHTML = 'Per-Bucket Traffic' +
+        (bucketTrafficOverflow ? ' <span class="overflow-badge">OVERFLOW ACTIVE</span>' : '');
+
+    const filter = (document.getElementById('bucket-traffic-filter').value || '').toLowerCase();
+    let rows = Object.entries(bucketTrafficData).filter(([k]) =>
+        !filter || k.toLowerCase().includes(filter)
+    );
+    // Sort alphabetically, but keep __other__ at the bottom
+    rows.sort(([a], [b]) => {
+        if (a.startsWith('__other__')) return 1;
+        if (b.startsWith('__other__')) return -1;
+        return a.localeCompare(b);
+    });
+
+    const total = rows.length;
+    const display = bucketTrafficShowAll ? rows : rows.slice(0, TRAFFIC_PAGE_SIZE);
+    const toggle = document.getElementById('bucket-traffic-toggle');
+    if (total > TRAFFIC_PAGE_SIZE) {
+        toggle.innerHTML = bucketTrafficShowAll
+            ? '<a style="color:#3498db;cursor:pointer;" onclick="bucketTrafficShowAll=false;renderBucketTraffic();">Show top ' + TRAFFIC_PAGE_SIZE + '</a>'
+            : '<a style="color:#3498db;cursor:pointer;" onclick="bucketTrafficShowAll=true;renderBucketTraffic();">Show all ' + total + ' rows</a>';
+    } else {
+        toggle.innerHTML = '';
+    }
+
+    const tbody = document.getElementById('bucket-traffic-body');
+    tbody.innerHTML = '';
+    display.forEach(([key, s]) => {
+        const isOverflow = key === '__other__' || key.startsWith('__other__/');
+        const displayName = isOverflow
+            ? escapeHtml(key) + '<span class="overflow-suffix">(overflow)</span>'
+            : escapeHtml(key);
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+            '<td>' + displayName + '</td>' +
+            '<td>' + formatNumber(s.get_requests) + '</td>' +
+            '<td>' + formatNumber(s.put_requests) + '</td>' +
+            '<td>' + escapeHtml(formatBytes(s.bytes_served)) + '</td>' +
+            '<td>' + escapeHtml(formatBytes(s.bytes_saved || 0)) + '</td>' +
+            '<td>' + escapeHtml(formatBytes(s.bytes_uploaded)) + '</td>';
+        tbody.appendChild(tr);
+    });
+}
+
+function formatBytes(bytes) {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    if (bytes === 0) return '0 B';
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    const val = bytes / Math.pow(1024, i);
+    return (val >= 100 ? val.toFixed(0) : val >= 10 ? val.toFixed(1) : val.toFixed(2)) + ' ' + units[i];
+}
+
+// Bucket traffic filter with debounce
+let bucketTrafficFilterTimeout;
+document.getElementById('bucket-traffic-filter').addEventListener('input', function() {
+    clearTimeout(bucketTrafficFilterTimeout);
+    bucketTrafficFilterTimeout = setTimeout(renderBucketTraffic, 200);
+});"#.to_string()
+    }
+}
+
+/// API handler for JSON endpoints
+pub struct ApiHandler {
+    cache_manager: Arc<RwLock<Option<Arc<CacheManager>>>>,
+    metrics_manager: Arc<RwLock<Option<Arc<RwLock<MetricsManager>>>>>,
+    log_reader: Arc<LogReader>,
+    // Cache for frequently accessed data to optimize response times
+    cached_stats: Arc<RwLock<Option<(SystemTime, CacheStatsResponse)>>>,
+    stats_cache_duration: std::time::Duration,
+    /// Dashboard config for refresh intervals
+    config: Arc<DashboardConfig>,
+    /// Active HTTP connections counter (shared with HttpProxy)
+    active_connections: Arc<RwLock<Option<Arc<std::sync::atomic::AtomicUsize>>>>,
+    /// Maximum concurrent requests from config
+    max_concurrent_requests: Arc<RwLock<usize>>,
+}
+
+impl ApiHandler {
+    pub fn new(log_reader: Arc<LogReader>, config: Arc<DashboardConfig>) -> Self {
+        Self {
+            cache_manager: Arc::new(RwLock::new(None)),
+            metrics_manager: Arc::new(RwLock::new(None)),
+            log_reader,
+            cached_stats: Arc::new(RwLock::new(None)),
+            stats_cache_duration: std::time::Duration::from_secs(2), // Cache stats for 2 seconds
+            config,
+            active_connections: Arc::new(RwLock::new(None)),
+            max_concurrent_requests: Arc::new(RwLock::new(0)),
+        }
+    }
+
+    pub async fn set_cache_manager(&self, cache_manager: Arc<CacheManager>) {
+        let mut cm = self.cache_manager.write().await;
+        *cm = Some(cache_manager);
+    }
+
+    pub async fn set_metrics_manager(&self, metrics_manager: Arc<RwLock<MetricsManager>>) {
+        let mut mm = self.metrics_manager.write().await;
+        *mm = Some(metrics_manager);
+    }
+
+    pub async fn set_active_connections(
+        &self,
+        active_connections: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent_requests: usize,
+    ) {
+        *self.active_connections.write().await = Some(active_connections);
+        *self.max_concurrent_requests.write().await = max_concurrent_requests;
+    }
+
+    pub async fn get_cache_stats(&self) -> Result<Response<String>> {
+        debug!("Dashboard API: cache stats requested");
+
+        // Check if we have a cached response that's still valid
+        {
+            let cached = self.cached_stats.read().await;
+            if let Some((cached_time, cached_response)) = cached.as_ref() {
+                if let Ok(elapsed) = SystemTime::now().duration_since(*cached_time) {
+                    if elapsed < self.stats_cache_duration {
+                        // Return cached response
+                        let body = serde_json::to_string(cached_response).map_err(|e| {
+                            error!("Failed to serialize cached cache stats: {}", e);
+                            ProxyError::SerializationError(format!(
+                                "Failed to serialize cached stats: {}",
+                                e
+                            ))
+                        })?;
+
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "application/json")
+                            .header("Cache-Control", "no-cache")
+                            .header("X-Cache", "HIT")
+                            .body(body)
+                            .map_err(|e| {
+                                error!("Failed to build cached response: {}", e);
+                                ProxyError::HttpError(format!(
+                                    "Failed to build cached response: {}",
+                                    e
+                                ))
+                            });
+                    }
+                }
+            }
+        }
+
+        // Generate fresh stats
+        let cache_manager_guard = self.cache_manager.read().await;
+        let metrics_manager_guard = self.metrics_manager.read().await;
+
+        let stats = if let Some(cache_manager) = cache_manager_guard.as_ref() {
+            debug!("Cache manager is available, getting cache statistics");
+            // Get cache statistics with updated sizes
+            let cache_stats = cache_manager.get_cache_size_stats().await.map_err(|e| {
+                error!("Failed to get cache size stats: {}", e);
+                e
+            })?;
+            debug!(
+                "Cache size stats: read_cache_size={}, write_cache_size={}, ram_cache_size={}",
+                cache_stats.read_cache_size,
+                cache_stats.write_cache_size,
+                cache_stats.ram_cache_size
+            );
+
+            let ram_stats = cache_manager.get_ram_cache_stats();
+            debug!("RAM cache stats available: {}", ram_stats.is_some());
+
+            // Get metadata cache stats
+            let metadata_cache = cache_manager.get_metadata_cache();
+            let metadata_stats = metadata_cache.metrics();
+            let metadata_entries = metadata_cache.len().await;
+            let metadata_max_entries = metadata_cache.config().max_entries;
+
+            // Calculate overall request count — computed after put_total is known (see below).
+
+            // Use RAM cache stats if available
+            let (ram_hit_rate, ram_hits, ram_misses, ram_evictions, ram_max_size) =
+                if let Some(ref ram_stats) = ram_stats {
+                    (
+                        ram_stats.hit_rate * 100.0,
+                        ram_stats.hit_count,
+                        ram_stats.miss_count,
+                        ram_stats.eviction_count,
+                        ram_stats.max_size,
+                    )
+                } else {
+                    // Fallback to the aggregate rate mirrored into cache_stats, which is
+                    // a 0.0-1.0 fraction and so needs scaling to a percentage here.
+                    (cache_stats.ram_cache_hit_rate * 100.0, 0, 0, 0, 0)
+                };
+
+            // Calculate disk cache statistics
+            // Disk hits = total GET hits minus RAM hits (requests served from disk, not RAM).
+            // Disk misses = total GET misses (every overall miss is also a disk miss).
+            // Note: ram_misses cannot be used for subtraction here because RAM misses
+            // include both "miss RAM, hit disk" and "miss RAM, miss disk" cases,
+            // making ram_misses >= get_misses and causing saturating_sub to yield 0.
+            let disk_only_get_hits = cache_stats.get_hits.saturating_sub(ram_hits);
+            let disk_only_get_misses = cache_stats.get_misses;
+
+            // Get uptime and PUT request count from metrics manager if available
+            let (uptime_seconds, put_total, page_cache, hedged_requests) = if let Some(
+                metrics_manager,
+            ) =
+                metrics_manager_guard.as_ref()
+            {
+                debug!("Metrics manager is available, getting uptime");
+                let fresh_metrics = metrics_manager.read().await.collect_metrics().await;
+                debug!(
+                    "Fresh metrics collected, uptime: {}",
+                    fresh_metrics.uptime_seconds
+                );
+
+                let put_total = fresh_metrics
+                    .signed_put
+                    .as_ref()
+                    .map(|sp| sp.cached_puts_total.saturating_add(sp.bypassed_puts_total))
+                    .unwrap_or(0);
+
+                // Use minimum of 1 second for uptime (0 is normal at startup)
+                (
+                    fresh_metrics.uptime_seconds.max(1),
+                    put_total,
+                    fresh_metrics.page_cache,
+                    fresh_metrics.hedged_requests,
+                )
+            } else {
+                warn!("Metrics manager not available in dashboard, this indicates a configuration issue");
+                // Fallback: return 0 to indicate the issue
+                (
+                    0,
+                    0,
+                    crate::metrics::PageCacheMetrics {
+                        widened_requests: 0,
+                        bytes_prefetched: 0,
+                        amplification_ratio: 1.0,
+                        page_hits: 0,
+                        skipped_signed_range: 0,
+                        fallbacks: 0,
+                        ram_page_promotions: 0,
+                        ram_page_promotion_skipped: 0,
+                    },
+                    crate::metrics::HedgingStats::default(),
+                )
+            };
+
+            // Overall request count: GETs + HEADs (cache hit/miss path) + PUTs
+            let total_requests = cache_stats
+                .cache_hits
+                .saturating_add(cache_stats.cache_misses)
+                .saturating_add(put_total);
+
+            // Calculate correct disk cache size (read cache only, write cache is separate)
+            // Note: disk_cache now shows only read cache, write_cache shows write cache separately
+            let disk_cache_size = cache_stats.read_cache_size;
+            let max_cache_size = cache_stats.max_cache_size_limit;
+
+            // Get write cache size and calculate max write cache size
+            // Write cache max is write_cache_percent of total cache (default 10%)
+            let write_cache_size = cache_stats.write_cache_size;
+            let write_cache_max_size =
+                (max_cache_size as f64 * cache_stats.max_write_cache_percent as f64 / 100.0) as u64;
+            let write_cache_utilization = if write_cache_max_size > 0 {
+                (write_cache_size as f64 / write_cache_max_size as f64 * 100.0) as f32
+            } else {
+                0.0
+            };
+
+            // Get last consolidation timestamp and cached_objects count from consolidator if available
+            let (last_consolidation, disk_cached_objects) =
+                if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
+                    let size_state = consolidator.get_size_state().await;
+                    let last_consol = if size_state.last_consolidation > std::time::UNIX_EPOCH {
+                        Some(size_state.last_consolidation)
+                    } else {
+                        None
+                    };
+                    (last_consol, Some(size_state.cached_objects))
+                } else {
+                    (None, None)
+                };
+
+            CacheStatsResponse {
+                timestamp: SystemTime::now(),
+                hostname: gethostname::gethostname().to_string_lossy().to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                ram_cache: CacheStats {
+                    hit_rate: ram_hit_rate,
+                    hits: ram_hits,
+                    misses: ram_misses,
+                    size_bytes: cache_stats.ram_cache_size,
+                    size_human: format_bytes(cache_stats.ram_cache_size),
+                    max_size_bytes: if ram_max_size > 0 {
+                        Some(ram_max_size)
+                    } else {
+                        None
+                    },
+                    max_size_human: if ram_max_size > 0 {
+                        Some(format_bytes(ram_max_size))
+                    } else {
+                        None
+                    },
+                    evictions: ram_evictions,
+                    cached_objects: None,
+                },
+                metadata_cache: MetadataCacheStats {
+                    hit_rate: if metadata_stats.hits + metadata_stats.misses > 0 {
+                        (metadata_stats.hits as f64
+                            / (metadata_stats.hits + metadata_stats.misses) as f64
+                            * 100.0) as f32
+                    } else {
+                        0.0
+                    },
+                    hits: metadata_stats.hits,
+                    misses: metadata_stats.misses,
+                    disk_hits: metadata_stats.disk_hits,
+                    entries: metadata_entries as u64,
+                    max_entries: metadata_max_entries as u64,
+                    evictions: metadata_stats.evictions,
+                    stale_refreshes: metadata_stats.stale_refreshes,
+                    stale_handle_errors: metadata_stats.stale_handle_errors,
+                    head_hits: metadata_stats.head_hits,
+                    head_misses: metadata_stats.head_misses,
+                    head_disk_hits: metadata_stats.head_disk_hits,
+                },
+                disk_cache: CacheStats {
+                    hit_rate: {
+                        let disk_total = disk_only_get_hits.saturating_add(disk_only_get_misses);
+                        if disk_total > 0 {
+                            (disk_only_get_hits as f64 / disk_total as f64 * 100.0) as f32
+                        } else {
+                            0.0
+                        }
+                    },
+                    hits: disk_only_get_hits,
+                    misses: disk_only_get_misses,
+                    size_bytes: disk_cache_size,
+                    size_human: format_bytes(disk_cache_size),
+                    max_size_bytes: if max_cache_size > 0 {
+                        Some(max_cache_size)
+                    } else {
+                        None
+                    },
+                    max_size_human: if max_cache_size > 0 {
+                        Some(format_bytes(max_cache_size))
+                    } else {
+                        None
+                    },
+                    evictions: cache_stats.evicted_entries,
+                    cached_objects: disk_cached_objects,
+                },
+                write_cache: WriteCacheStats {
+                    size_bytes: write_cache_size,
+                    size_human: format_bytes(write_cache_size),
+                    max_size_bytes: write_cache_max_size,
+                    max_size_human: format_bytes(write_cache_max_size),
+                    utilization_percent: write_cache_utilization,
+                    evicted_uploads: cache_stats.incomplete_uploads_evicted,
+                },
+                overall: OverallStats {
+                    total_requests,
+                    put_total,
+                    head_total: cache_stats
+                        .head_hits
+                        .saturating_add(cache_stats.head_misses),
+                    get_total: cache_stats.get_hits.saturating_add(cache_stats.get_misses),
+                    head_hits: cache_stats.head_hits,
+                    head_misses: cache_stats.head_misses,
+                    get_hits: cache_stats.get_hits,
+                    get_misses: cache_stats.get_misses,
+                    uptime_seconds,
+                    s3_transfer_saved_bytes: cache_stats.bytes_served_from_cache,
+                    s3_transfer_saved_human: format_bytes(cache_stats.bytes_served_from_cache),
+                    s3_requests_saved: cache_stats.cache_hits,
+                },
+                last_consolidation,
+                page_cache,
+                hedged_requests,
+            }
+        } else {
+            // Return service unavailable if cache manager is not available
+            warn!("Dashboard API: cache manager not available, returning service unavailable");
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "application/json")
+                .header("Cache-Control", "no-cache")
+                .header("Retry-After", "30")
+                .body(r#"{"error": "Cache manager not available", "code": 503, "message": "The cache manager is currently unavailable. Please try again later."}"#.to_string())
+                .map_err(|e| {
+                    error!("Failed to build service unavailable response: {}", e);
+                    ProxyError::HttpError(format!("Failed to build error response: {}", e))
+                });
+        };
+
+        // Cache the response with error handling
+        let mut cached = self.cached_stats.write().await;
+        *cached = Some((SystemTime::now(), stats.clone()));
+
+        let body = serde_json::to_string(&stats).map_err(|e| {
+            error!("Failed to serialize cache stats: {}", e);
+            ProxyError::SerializationError(format!("Failed to serialize cache stats: {}", e))
+        })?;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .header("X-Cache", "MISS")
+            .body(body)
+            .map_err(|e| {
+                error!("Failed to build cache stats response: {}", e);
+                ProxyError::HttpError(format!("Failed to build cache stats response: {}", e))
+            })
+    }
+
+    pub async fn get_system_info(&self) -> Result<Response<String>> {
+        debug!("Dashboard API: system info requested");
+
+        let start_time = std::time::Instant::now();
+
+        // Get uptime from metrics manager if available with error handling
+        let uptime_seconds =
+            if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
+                match metrics_manager.read().await.get_cached_metrics().await {
+                    Some(cached_metrics) => cached_metrics.uptime_seconds,
+                    None => {
+                        debug!("No cached metrics available for system info, using system time");
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    }
+                }
+            } else {
+                debug!("Metrics manager not available for system info, using system time");
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            };
+
+        // Get active/max concurrent requests directly from atomic counter (real-time)
+        let active_requests_val = self
+            .active_connections
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64)
+            .unwrap_or(0);
+        let max_concurrent_val = *self.max_concurrent_requests.read().await as u64;
+
+        // permits_held: request-concurrency permits held, distinct from the TCP
+        // connection count above. Sourced from the metrics manager's cached snapshot
+        // rather than re-deriving from the semaphore directly, since ApiHandler does
+        // not hold it independently. Requirement: TCA 5.1, 5.5, 5.6
+        let permits_held_val =
+            if let Some(metrics_manager) = self.metrics_manager.read().await.as_ref() {
+                match metrics_manager.read().await.get_cached_metrics().await {
+                    Some(cached_metrics) => cached_metrics.request_metrics.permits_held,
+                    None => 0,
+                }
+            } else {
+                0
+            };
+
+        let system_info = SystemInfoResponse {
+            timestamp: SystemTime::now(),
+            hostname: gethostname::gethostname().to_string_lossy().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_seconds,
+            status: "running".to_string(),
+            cache_stats_refresh_ms: self.config.cache_stats_refresh_interval.as_millis() as u64,
+            logs_refresh_ms: self.config.logs_refresh_interval.as_millis() as u64,
+            active_requests: active_requests_val,
+            max_concurrent_requests: max_concurrent_val,
+            permits_held: permits_held_val,
+        };
+
+        let body = serde_json::to_string(&system_info).map_err(|e| {
+            error!("Failed to serialize system info: {}", e);
+            ProxyError::SerializationError(format!("Failed to serialize system info: {}", e))
+        })?;
+
+        let elapsed = start_time.elapsed();
+        debug!("System info API response generated in {:?}", elapsed);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .header("X-Response-Time", &format!("{}ms", elapsed.as_millis()))
+            .body(body)
+            .map_err(|e| {
+                error!("Failed to build system info response: {}", e);
+                ProxyError::HttpError(format!("Failed to build system info response: {}", e))
+            })
+    }
+
+    pub async fn get_logs(&self, params: LogQueryParams) -> Result<Response<String>> {
+        debug!(
+            "Dashboard API: logs requested with limit={:?}, level_filter={:?}",
+            params.limit, params.level_filter
+        );
+
+        // Optimize log reading with early limits and efficient processing
+        let start_time = std::time::Instant::now();
+
+        // Read logs with comprehensive error handling
+        let entries = match self.log_reader.read_recent_logs(params).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!("Failed to read log files: {}", e);
+                // Return 500 with error details
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("Content-Type", "application/json")
+                    .header("Cache-Control", "no-cache")
+                    .body(format!(
+                        r#"{{"error": "Failed to read log files", "code": 500, "message": "{}"}}"#,
+                        e.to_string().replace('"', "\\\"")
+                    ))
+                    .map_err(|e| {
+                        error!("Failed to build error response: {}", e);
+                        ProxyError::HttpError(format!("Failed to build error response: {}", e))
+                    });
+            }
+        };
+
+        let response = LogsResponse {
+            entries: entries.clone(),
+            total_count: entries.len(),
+            has_more: false, // Simplified for now
+        };
+
+        let body = serde_json::to_string(&response).map_err(|e| {
+            error!("Failed to serialize logs response: {}", e);
+            ProxyError::SerializationError(format!("Failed to serialize logs: {}", e))
+        })?;
+
+        let elapsed = start_time.elapsed();
+        debug!("Log API response generated in {:?}", elapsed);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .header("X-Response-Time", &format!("{}ms", elapsed.as_millis()))
+            .body(body)
+            .map_err(|e| {
+                error!("Failed to build logs response: {}", e);
+                ProxyError::HttpError(format!("Failed to build logs response: {}", e))
+            })
+    }
+
+    /// Return per-bucket cache hit/miss stats and resolved settings summary.
+    pub async fn get_bucket_stats(&self) -> Result<Response<String>> {
+        debug!("Dashboard API: bucket stats requested");
+
+        let cache_manager_guard = self.cache_manager.read().await;
+        let metrics_manager_guard = self.metrics_manager.read().await;
+
+        let cache_manager = match cache_manager_guard.as_ref() {
+            Some(cm) => cm,
+            None => {
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("Content-Type", "application/json")
+                    .header("Cache-Control", "no-cache")
+                    .body(r#"{"error": "Cache manager not available", "code": 503}"#.to_string())
+                    .map_err(|e| {
+                        ProxyError::HttpError(format!("Failed to build response: {}", e))
+                    });
+            }
+        };
+
+        let bsm = cache_manager.get_bucket_settings_manager();
+        let rules = bsm.rules().await;
+
+        // Get per-rule cache stats from metrics manager (keyed by glob pattern)
+        let rule_cache_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
+            mm.read().await.get_rule_cache_stats().await
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Build the ordered rule entries with their resolved fields and stats.
+        let rule_entries: Vec<RuleStatsEntry> = rules
+            .iter()
+            .map(|r| {
+                let rs = rule_cache_stats.get(&r.pattern);
+                RuleStatsEntry {
+                    pattern: r.pattern.clone(),
+                    get_ttl: r.get_ttl.map(crate::bucket_settings::format_duration),
+                    head_ttl: r.head_ttl.map(crate::bucket_settings::format_duration),
+                    put_ttl: r.put_ttl.map(crate::bucket_settings::format_duration),
+                    read_cache_enabled: r.read_cache_enabled,
+                    write_cache_enabled: r.write_cache_enabled,
+                    compression_enabled: r.compression_enabled,
+                    ram_cache_eligible: r.ram_cache_eligible,
+                    evaluate_conditions_from_cache: r.evaluate_conditions_from_cache,
+                    page_widening: r.page_widening,
+                    page_size: r.page_size,
+                    hedging_enabled: r.hedging_enabled,
+                    hedge_trigger_after: r
+                        .hedge_trigger_after
+                        .map(crate::bucket_settings::format_duration),
+                    hedge_max_per_request: r.hedge_max_per_request,
+                    head_hit_count: rs.map_or(0, |s| s.head_hit_count),
+                    head_miss_count: rs.map_or(0, |s| s.head_miss_count),
+                    get_hit_count: rs.map_or(0, |s| s.get_hit_count),
+                    get_miss_count: rs.map_or(0, |s| s.get_miss_count),
+                }
+            })
+            .collect();
+
+        let response = BucketStatsResponse {
+            rules: rule_entries,
+        };
+        let body = serde_json::to_string(&response).map_err(|e| {
+            error!("Failed to serialize bucket stats: {}", e);
+            ProxyError::SerializationError(format!("Failed to serialize bucket stats: {}", e))
+        })?;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .body(body)
+            .map_err(|e| {
+                error!("Failed to build bucket stats response: {}", e);
+                ProxyError::HttpError(format!("Failed to build bucket stats response: {}", e))
+            })
+    }
+
+    /// Return per-bucket traffic stats for `/api/bucket-traffic`.
+    pub async fn get_bucket_traffic(&self) -> Result<Response<String>> {
+        debug!("Dashboard API: bucket traffic requested");
+
+        let metrics_manager_guard = self.metrics_manager.read().await;
+
+        let traffic_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
+            mm.read().await.get_bucket_traffic_stats().await
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // overflow_active is derived — never stored — from the presence of "__other__"
+        let overflow_key = crate::metrics::BucketTrafficKey {
+            bucket: "__other__".to_string(),
+            prefix: None,
+        };
+        let overflow_active = traffic_stats.contains_key(&overflow_key);
+
+        // Build the response map: key is "bucket" or "bucket/prefix"
+        let mut bucket_traffic: std::collections::HashMap<String, BucketTrafficEntry> =
+            std::collections::HashMap::new();
+        for (key, stats) in &traffic_stats {
+            let display_key = match &key.prefix {
+                None => key.bucket.clone(),
+                Some(p) => format!("{}/{}", key.bucket, p),
+            };
+            bucket_traffic.insert(
+                display_key,
+                BucketTrafficEntry {
+                    bytes_served: stats.bytes_served,
+                    bytes_saved: stats.bytes_saved,
+                    bytes_uploaded: stats.bytes_uploaded,
+                    get_requests: stats.get_requests,
+                    put_requests: stats.put_requests,
+                },
+            );
+        }
+
+        let response = BucketTrafficResponse {
+            bucket_traffic,
+            overflow_active,
+        };
+
+        let body = serde_json::to_string(&response).map_err(|e| {
+            error!("Failed to serialize bucket traffic: {}", e);
+            ProxyError::SerializationError(format!("Failed to serialize bucket traffic: {}", e))
+        })?;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .body(body)
+            .map_err(|e| {
+                error!("Failed to build bucket traffic response: {}", e);
+                ProxyError::HttpError(format!("Failed to build bucket traffic response: {}", e))
+            })
+    }
+
+    /// Return download bandwidth QoS metrics as JSON (`/api/bandwidth`).
+    pub async fn get_bandwidth_metrics(&self) -> Result<Response<String>> {
+        debug!("Dashboard API: bandwidth metrics requested");
+        let snapshot = crate::bandwidth_limiter::global_limiter().snapshot();
+        let body = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache")
+            .body(body)
+            .map_err(|e| {
+                ProxyError::HttpError(format!("Failed to build bandwidth response: {}", e))
+            })
+    }
+}
+
+/// Log reader for application logs
+pub struct LogReader {
+    app_log_dir: PathBuf,
+    hostname: String,
+}
+
+impl LogReader {
+    pub fn new(app_log_dir: PathBuf, hostname: String) -> Self {
+        Self {
+            app_log_dir,
+            hostname,
+        }
+    }
+
+    pub async fn read_recent_logs(&self, params: LogQueryParams) -> Result<Vec<LogEntry>> {
+        let limit = params.limit.unwrap_or(100);
+        debug!(
+            "Reading logs with params: limit={}, level_filter={:?}",
+            limit, params.level_filter
+        );
+
+        let mut entries = Vec::new();
+
+        // Get the host-specific log directory
+        let host_log_dir = self.app_log_dir.join(&self.hostname);
+
+        if !host_log_dir.exists() {
+            debug!("Log directory does not exist: {:?}", host_log_dir);
+            return Ok(entries);
+        }
+
+        // Check if directory is readable
+        if let Err(e) = tokio::fs::metadata(&host_log_dir).await {
+            warn!("Cannot access log directory {:?}: {}", host_log_dir, e);
+            return Err(ProxyError::IoError(format!(
+                "Cannot access log directory {:?}: {}",
+                host_log_dir, e
+            )));
+        }
+
+        // Find the most recent log files with error handling
+        let log_files = match self.find_recent_log_files(&host_log_dir) {
+            Ok(files) => files,
+            Err(e) => {
+                error!("Failed to find log files in {:?}: {}", host_log_dir, e);
+                return Err(e);
+            }
+        };
+
+        if log_files.is_empty() {
+            debug!("No log files found in {:?}", host_log_dir);
+            return Ok(entries);
+        }
+
+        for log_file in log_files {
+            if entries.len() >= limit {
+                break;
+            }
+
+            match self
+                .read_log_file(&log_file, &params, limit - entries.len())
+                .await
+            {
+                Ok(file_entries) => {
+                    entries.extend(file_entries);
+                }
+                Err(e) => {
+                    // Log the error but continue with other files
+                    warn!("Failed to read log file {:?}: {}", log_file, e);
+                    continue;
+                }
+            }
+        }
+
+        // Sort by timestamp (most recent first) and limit
+        entries.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
+        entries.truncate(limit);
+
+        Ok(entries)
+    }
+
+    /// Find recent log files, sorted by modification time (newest first)
+    fn find_recent_log_files(&self, log_dir: &PathBuf) -> Result<Vec<PathBuf>> {
+        let mut log_files = Vec::new();
+
+        let entries = std::fs::read_dir(log_dir).map_err(|e| {
+            ProxyError::IoError(format!("Failed to read log directory {:?}: {}", log_dir, e))
+        })?;
+
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+
+                    // Check if it's a file and has the right extension/name
+                    if let Ok(metadata) = path.metadata() {
+                        if metadata.is_file() {
+                            let is_log_file = path.extension().is_some_and(|ext| ext == "log")
+                                || path.file_name().is_some_and(|name| {
+                                    name.to_string_lossy().contains("s3-proxy.log")
+                                });
+
+                            if is_log_file {
+                                log_files.push(path);
+                            }
+                        }
+                    } else {
+                        // Skip files we can't read metadata for
+                        debug!("Skipping file with unreadable metadata: {:?}", path);
+                    }
+                }
+                Err(e) => {
+                    // Log but continue with other entries
+                    debug!("Skipping directory entry due to error: {}", e);
+                }
+            }
+        }
+
+        // Sort by modification time (newest first) with error handling
+        log_files.sort_by(|a, b| {
+            let a_time = a
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let b_time = b
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            b_time.cmp(&a_time)
+        });
+
+        Ok(log_files)
+    }
+
+    /// Read log entries from a single log file
+    async fn read_log_file(
+        &self,
+        file_path: &PathBuf,
+        params: &LogQueryParams,
+        max_entries: usize,
+    ) -> Result<Vec<LogEntry>> {
+        let mut entries = Vec::new();
+
+        // For performance, limit the amount of file we read
+        let max_file_size = 1024 * 1024; // 1MB max per file
+        let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
+            ProxyError::IoError(format!("Failed to get metadata for {:?}: {}", file_path, e))
+        })?;
+
+        let file_size = metadata.len() as usize;
+        let read_size = std::cmp::min(file_size, max_file_size);
+
+        // Read from the end of the file for recent entries
+        let mut file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            ProxyError::IoError(format!("Failed to open log file {:?}: {}", file_path, e))
+        })?;
+
+        let start_pos = file_size.saturating_sub(read_size);
+
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        file.seek(std::io::SeekFrom::Start(start_pos as u64))
+            .await
+            .map_err(|e| {
+                ProxyError::IoError(format!("Failed to seek in log file {:?}: {}", file_path, e))
+            })?;
+
+        let mut buffer = vec![0u8; read_size];
+        let bytes_read = file.read(&mut buffer).await.map_err(|e| {
+            ProxyError::IoError(format!("Failed to read log file {:?}: {}", file_path, e))
+        })?;
+
+        let content = String::from_utf8_lossy(&buffer[..bytes_read]);
+
+        // Process lines in reverse order to get most recent entries first
+        let lines: Vec<&str> = content.lines().collect();
+        for line in lines.iter().rev() {
+            if entries.len() >= max_entries {
+                break;
+            }
+
+            if let Some(entry) = self.parse_log_line(line) {
+                // Apply level filter if specified
+                if let Some(ref level_filter) = params.level_filter {
+                    if entry.level != *level_filter {
+                        continue;
+                    }
+                }
+
+                // Apply time filter if specified
+                if let Some(since) = params.since {
+                    if entry.timestamp < since {
+                        continue;
+                    }
+                }
+
+                // Apply text filter if specified (case-insensitive search in message and target)
+                if let Some(ref text_filter) = params.text_filter {
+                    let text_lower = text_filter.to_lowercase();
+                    let message_lower = entry.message.to_lowercase();
+                    let target_lower = entry.target.to_lowercase();
+                    if !message_lower.contains(&text_lower) && !target_lower.contains(&text_lower) {
+                        continue;
+                    }
+                }
+
+                entries.push(entry);
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Parse a single log line in tracing format
+    fn parse_log_line(&self, line: &str) -> Option<LogEntry> {
+        // Tracing format has inconsistent spacing:
+        // ERROR: 2026-01-23T09:05:11.370707948+00:00 ERROR ThreadId(07) ... (single space)
+        // INFO/WARN/DEBUG: 2026-01-23T15:24:13.161401787+00:00  INFO ThreadId(05) ... (double space)
+
+        if line.trim().is_empty() {
+            return None;
+        }
+
+        // Find the timestamp end (first space after timestamp)
+        let timestamp_end = line.find(' ')?;
+        let timestamp_str = &line[..timestamp_end];
+
+        // Parse timestamp
+        let timestamp = match chrono::DateTime::parse_from_rfc3339(timestamp_str) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(_) => {
+                // Try parsing without timezone
+                match chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.f") {
+                    Ok(ndt) => {
+                        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc)
+                    }
+                    Err(_) => return None,
+                }
+            }
+        };
+
+        // Get the rest after timestamp, trimming any leading spaces (handles both single and double space)
+        let rest = line[timestamp_end..].trim_start();
+
+        // Split on spaces to get level and remaining parts
+        let rest_parts: Vec<&str> = rest.splitn(3, ' ').collect();
+        if rest_parts.len() < 3 {
+            return None;
+        }
+
+        // Parse level
+        let level = rest_parts[0].to_string();
+
+        // Skip ThreadId part and get target and message
+        let after_thread = rest_parts[2]; // This should be "s3_proxy::cache_size_tracker: src/cache_size_tracker.rs:1250: Cache validation: scanning 5 metadata files using shared validator"
+
+        // Split on the first colon to separate target from location:message
+        let (target, location_and_message) = if let Some(colon_pos) = after_thread.find(": ") {
+            let target_part = after_thread[..colon_pos].trim();
+            let rest = after_thread[colon_pos + 2..].trim(); // Skip ": "
+            (target_part.to_string(), rest)
+        } else {
+            ("unknown".to_string(), after_thread)
+        };
+
+        // Split location from message (location format: src/file.rs:line:)
+        // Look for the pattern ": " after a file location to separate location from message
+        let message = if let Some(location_end) = location_and_message.find(": ") {
+            // Check if this looks like a file location (contains .rs: followed by number)
+            let before_colon = &location_and_message[..location_end];
+            if before_colon.contains(".rs:")
+                && before_colon
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_digit())
+            {
+                location_and_message[location_end + 2..].to_string()
+            } else {
+                location_and_message.to_string()
+            }
+        } else {
+            location_and_message.to_string()
+        };
+
+        // Extract structured fields from the message (simplified)
+        let mut fields = HashMap::new();
+
+        // Look for key=value patterns in the message
+        if let Ok(key_value_regex) = regex::Regex::new(r"(\w+)=([^\s,]+)") {
+            for cap in key_value_regex.captures_iter(&message) {
+                if let (Some(key), Some(value)) = (cap.get(1), cap.get(2)) {
+                    fields.insert(key.as_str().to_string(), value.as_str().to_string());
+                }
+            }
+        }
+
+        Some(LogEntry {
+            timestamp,
+            level,
+            target,
+            message,
+            fields,
+        })
+    }
+}
+
+/// Cache statistics response structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStatsResponse {
+    pub timestamp: SystemTime,
+    pub hostname: String,
+    pub version: String,
+    pub ram_cache: CacheStats,
+    pub metadata_cache: MetadataCacheStats,
+    pub disk_cache: CacheStats,       // Read cache (object cache)
+    pub write_cache: WriteCacheStats, // Write cache (mpus_in_progress)
+    pub overall: OverallStats,
+    /// Timestamp of last consolidation cycle
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_consolidation: Option<SystemTime>,
+    /// Page-aligned range caching (widening) metrics.
+    /// Spec: page-aligned-range-cache. Requirements: 8.1-8.6
+    pub page_cache: crate::metrics::PageCacheMetrics,
+    /// Hedged upstream request metrics.
+    /// Spec: hedged-upstream-requests. Requirements: 8.1, 8.2, 8.3
+    #[serde(default)]
+    pub hedged_requests: crate::metrics::HedgingStats,
+}
+
+/// Write cache statistics (MPUs in progress and PUT objects not yet read)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteCacheStats {
+    pub size_bytes: u64,
+    pub size_human: String,
+    pub max_size_bytes: u64, // Write cache limit (% of total cache)
+    pub max_size_human: String,
+    pub utilization_percent: f32,
+    pub evicted_uploads: u64, // Number of incomplete uploads evicted
+}
+
+/// Metadata cache statistics (RAM cache for NewCacheMetadata objects)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataCacheStats {
+    pub hit_rate: f32,
+    pub hits: u64,
+    pub misses: u64,
+    pub disk_hits: u64,
+    pub entries: u64,
+    pub max_entries: u64,
+    pub evictions: u64,
+    pub stale_refreshes: u64,
+    pub stale_handle_errors: u64,
+    /// HEAD-request-specific counters (subset of hits/misses/disk_hits)
+    pub head_hits: u64,
+    pub head_misses: u64,
+    pub head_disk_hits: u64,
+}
+
+/// Individual cache statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStats {
+    pub hit_rate: f32,
+    pub hits: u64,
+    pub misses: u64,
+    pub size_bytes: u64,
+    pub size_human: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_size_human: Option<String>,
+    pub evictions: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_objects: Option<u64>,
+}
+
+/// Overall system statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverallStats {
+    pub total_requests: u64,
+    pub put_total: u64,
+    pub head_total: u64,
+    pub get_total: u64,
+    pub head_hits: u64,
+    pub head_misses: u64,
+    pub get_hits: u64,
+    pub get_misses: u64,
+    pub uptime_seconds: u64,
+    pub s3_transfer_saved_bytes: u64,
+    pub s3_transfer_saved_human: String,
+    pub s3_requests_saved: u64,
+}
+
+/// System information response structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInfoResponse {
+    pub timestamp: SystemTime,
+    pub hostname: String,
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub status: String,
+    /// Cache stats refresh interval in milliseconds (from config)
+    pub cache_stats_refresh_ms: u64,
+    /// Logs refresh interval in milliseconds (from config)
+    pub logs_refresh_ms: u64,
+    /// Active TCP connections. Kept for backward compatibility with existing
+    /// dashboard/API consumers; HTTP/1 keep-alive means this is not in-flight
+    /// request count. Prefer `permits_held` for a request-concurrency figure.
+    pub active_requests: u64,
+    /// Maximum concurrent requests allowed
+    pub max_concurrent_requests: u64,
+    /// Request-concurrency permits currently held. This is what the dashboard's
+    /// `Requests: N / M` tile now pairs with `max_concurrent_requests`, replacing
+    /// `active_requests` (a connection count) as that tile's numerator.
+    /// Requirement: TCA 5.6
+    pub permits_held: u64,
+}
+
+/// Log entry structure
+#[derive(Debug, Clone, Serialize)]
+pub struct LogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+    pub fields: HashMap<String, String>,
+}
+
+/// Log query parameters
+#[derive(Debug)]
+pub struct LogQueryParams {
+    pub limit: Option<usize>,
+    pub level_filter: Option<String>,
+    pub text_filter: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// Logs response structure
+#[derive(Debug, Serialize)]
+pub struct LogsResponse {
+    pub entries: Vec<LogEntry>,
+    pub total_count: usize,
+    pub has_more: bool,
+}
+
+/// Cache rules response for `/api/bucket-stats`
+#[derive(Debug, Serialize)]
+pub struct BucketStatsResponse {
+    pub rules: Vec<RuleStatsEntry>,
+}
+
+/// Per-bucket traffic response for `/api/bucket-traffic`
+#[derive(Debug, Serialize)]
+pub struct BucketTrafficResponse {
+    /// Map from "bucket" or "bucket/prefix" to traffic stats.
+    pub bucket_traffic: std::collections::HashMap<String, BucketTrafficEntry>,
+    /// True when the `__other__` overflow series is present (derived, never stored).
+    pub overflow_active: bool,
+}
+
+/// Traffic counters for a single bucket (or bucket+prefix) series.
+/// Scope: object reads (GET) and object/part writes (PUT/UploadPart).
+#[derive(Debug, Serialize)]
+pub struct BucketTrafficEntry {
+    pub bytes_served: u64,
+    pub bytes_saved: u64,
+    pub bytes_uploaded: u64,
+    pub get_requests: u64,
+    pub put_requests: u64,
+}
+
+/// One active cache rule, its set fields, and its hit/miss stats.
+#[derive(Debug, Serialize)]
+pub struct RuleStatsEntry {
+    pub pattern: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub get_ttl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_ttl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub put_ttl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_cache_eligible: Option<bool>,
+    /// Whether this rule evaluates client conditional headers locally against
+    /// cached metadata ("Mode B") instead of forwarding them to S3. Surfaced
+    /// because it has an audit-relevant consequence: when on, S3 does not
+    /// re-validate the caller's credentials on that conditional request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluate_conditions_from_cache: Option<bool>,
+    /// Page-aligned range caching opt-in for this rule.
+    /// Spec: page-aligned-range-cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_widening: Option<bool>,
+    /// Page size in bytes used when `page_widening` is enabled.
+    /// Spec: page-aligned-range-cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u64>,
+    /// Hedged upstream requests opt-in for this rule.
+    /// Spec: hedged-upstream-requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedging_enabled: Option<bool>,
+    /// TTFB threshold after which a hedge is issued.
+    /// Spec: hedged-upstream-requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedge_trigger_after: Option<String>,
+    /// Per-request hedge budget.
+    /// Spec: hedged-upstream-requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hedge_max_per_request: Option<usize>,
+    // Per-rule hit/miss stats
+    pub head_hit_count: u64,
+    pub head_miss_count: u64,
+    pub get_hit_count: u64,
+    pub get_miss_count: u64,
+}
+
+/// Validate log query parameters
+pub fn validate_log_params(params: &LogQueryParams) -> Option<String> {
+    // Check limit bounds
+    if let Some(limit) = params.limit {
+        if limit == 0 {
+            return Some("Limit must be greater than 0".to_string());
+        }
+        if limit > 10000 {
+            return Some("Limit cannot exceed 10000".to_string());
+        }
+    }
+
+    // Check log level validity
+    if let Some(ref level) = params.level_filter {
+        match level.as_str() {
+            "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE" => {
+                // Valid log level
+            }
+            _ => {
+                return Some(format!(
+                    "Invalid log level '{}'. Must be one of: ERROR, WARN, INFO, DEBUG, TRACE",
+                    level
+                ));
+            }
+        }
+    }
+
+    // Check timestamp validity (when implemented)
+    if params.since.is_some() {
+        return Some("Since parameter is not yet implemented".to_string());
+    }
+
+    None // No validation errors
+}
+
+/// Parse and validate log query parameters from URI
+pub fn parse_log_query_params(uri: &Uri) -> LogQueryParams {
+    let mut limit = None;
+    let mut level_filter = None;
+    let mut text_filter = None;
+    let since = None; // Not implemented yet
+
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                // URL decode the value
+                let decoded_value = urlencoding::decode(value).unwrap_or_else(|_| {
+                    warn!("Failed to URL decode parameter value: {}", value);
+                    std::borrow::Cow::Borrowed(value)
+                });
+
+                match key {
+                    "limit" => {
+                        match decoded_value.parse::<usize>() {
+                            Ok(l) => {
+                                // Validate limit bounds (1 to 10000)
+                                if (1..=10000).contains(&l) {
+                                    limit = Some(l);
+                                } else {
+                                    warn!("Invalid limit parameter: {} (must be 1-10000)", l);
+                                }
+                            }
+                            Err(_) => {
+                                warn!("Invalid limit parameter format: {}", decoded_value);
+                            }
+                        }
+                    }
+                    "level" => {
+                        let level_str = decoded_value.trim().to_uppercase();
+                        // Validate log level and sanitize input
+                        if !level_str.is_empty() {
+                            // Additional sanitization: only allow alphanumeric characters
+                            if level_str.chars().all(|c| c.is_ascii_alphanumeric()) {
+                                match level_str.as_str() {
+                                    "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE" => {
+                                        level_filter = Some(level_str);
+                                    }
+                                    _ => {
+                                        warn!("Invalid log level parameter: {} (must be ERROR, WARN, INFO, DEBUG, or TRACE)", level_str);
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "Log level parameter contains invalid characters: {}",
+                                    level_str
+                                );
+                            }
+                        }
+                    }
+                    "text" => {
+                        let text_str = decoded_value.trim().to_string();
+                        if !text_str.is_empty() && text_str.len() <= 200 {
+                            text_filter = Some(text_str);
+                        } else if text_str.len() > 200 {
+                            warn!("Text filter too long: {} chars (max 200)", text_str.len());
+                        }
+                    }
+                    "since" => {
+                        // Since parameter reserved for future use
+                        debug!("Since parameter not yet implemented: {}", decoded_value);
+                    }
+                    _ => {
+                        // Log unknown parameters but don't fail
+                        debug!("Unknown query parameter: {}={}", key, decoded_value);
+                    }
+                }
+            } else {
+                // Handle malformed parameter pairs
+                warn!("Malformed query parameter: {}", pair);
+            }
+        }
+    }
+
+    LogQueryParams {
+        limit,
+        level_filter,
+        text_filter,
+        since,
+    }
+}
+
+/// Format bytes into human-readable format using binary units (IEC standard)
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    const THRESHOLD: f64 = 1024.0;
+
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let bytes_f = bytes as f64;
+    let unit_index = (bytes_f.log10() / THRESHOLD.log10()).floor() as usize;
+    let unit_index = unit_index.min(UNITS.len() - 1);
+
+    let value = bytes_f / THRESHOLD.powi(unit_index as i32);
+
+    if value >= 100.0 {
+        format!("{:.0} {}", value, UNITS[unit_index])
+    } else if value >= 10.0 {
+        format!("{:.1} {}", value, UNITS[unit_index])
+    } else {
+        format!("{:.2} {}", value, UNITS[unit_index])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 9.3 — `/api/bucket-traffic` response shape test.
+    ///
+    /// Directly constructs the `BucketTrafficResponse` that `get_bucket_traffic()`
+    /// would build, serializes it to JSON, and asserts:
+    /// - all nine counter fields are present in each entry
+    /// - `overflow_active` is `false` when no `__other__` sentinel is present
+    ///
+    /// This exercises the same serde shape that the live endpoint returns, since
+    /// the endpoint is a thin JSON wrapper around the same struct.
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 3.2
+    #[test]
+    fn test_bucket_traffic_api_shape() {
+        // Build the response struct that the handler would produce.
+        let mut bucket_traffic = std::collections::HashMap::new();
+        bucket_traffic.insert(
+            "alpha-bucket".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 1000,
+                bytes_saved: 0,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+        bucket_traffic.insert(
+            "beta-bucket".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 512,
+                bytes_saved: 0,
+                bytes_uploaded: 2048,
+                get_requests: 0,
+                put_requests: 1,
+            },
+        );
+
+        let response = BucketTrafficResponse {
+            bucket_traffic,
+            overflow_active: false,
+        };
+
+        // Serialize to the same JSON the endpoint emits.
+        let body = serde_json::to_string(&response).expect("serializes");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("parses");
+
+        // overflow_active field present and false.
+        assert_eq!(v["overflow_active"].as_bool(), Some(false));
+
+        let traffic = v["bucket_traffic"].as_object().expect("object");
+        assert_eq!(traffic.len(), 2, "two buckets");
+
+        let alpha = &traffic["alpha-bucket"];
+        assert_eq!(alpha["bytes_served"].as_u64(), Some(1000));
+        assert_eq!(alpha["bytes_uploaded"].as_u64(), Some(0));
+        assert_eq!(alpha["get_requests"].as_u64(), Some(1));
+        assert_eq!(alpha["put_requests"].as_u64(), Some(0));
+
+        let beta = &traffic["beta-bucket"];
+        assert_eq!(beta["bytes_served"].as_u64(), Some(512));
+        assert_eq!(beta["bytes_uploaded"].as_u64(), Some(2048));
+        assert_eq!(beta["put_requests"].as_u64(), Some(1));
+    }
+
+    /// Task 9.3 (overflow variant) — `overflow_active` is `true` when the
+    /// `__other__` overflow sentinel appears in `bucket_traffic`.
+    ///
+    /// Spec: per-bucket-metrics. Requirements: 3.2
+    #[test]
+    fn test_bucket_traffic_api_overflow_active() {
+        let mut bucket_traffic = std::collections::HashMap::new();
+        bucket_traffic.insert(
+            "bkt-one".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 100,
+                bytes_saved: 0,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+        bucket_traffic.insert(
+            "bkt-two".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 100,
+                bytes_saved: 0,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+        // Overflow sentinel — present because a third bucket was folded.
+        bucket_traffic.insert(
+            "__other__".to_string(),
+            BucketTrafficEntry {
+                bytes_served: 50,
+                bytes_saved: 0,
+                bytes_uploaded: 0,
+                get_requests: 1,
+                put_requests: 0,
+            },
+        );
+
+        let response = BucketTrafficResponse {
+            bucket_traffic,
+            overflow_active: true, // set by the handler when __other__ is present
+        };
+
+        let body = serde_json::to_string(&response).expect("serializes");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("parses");
+
+        assert_eq!(
+            v["overflow_active"].as_bool(),
+            Some(true),
+            "overflow_active must be true"
+        );
+
+        let traffic = v["bucket_traffic"].as_object().expect("object");
+        assert_eq!(traffic.len(), 3, "2 real + 1 overflow = 3 entries");
+        assert!(
+            traffic.contains_key("__other__"),
+            "__other__ sentinel must appear in the response"
+        );
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(1536), "1.50 KiB");
+        assert_eq!(format_bytes(1048576), "1.00 MiB");
+        assert_eq!(format_bytes(1073741824), "1.00 GiB");
+    }
+
+    #[test]
+    fn test_parse_log_query_params() {
+        let uri: Uri = "/api/logs?limit=50&level=ERROR".parse().unwrap();
+        let params = parse_log_query_params(&uri);
+
+        assert_eq!(params.limit, Some(50));
+        assert_eq!(params.level_filter, Some("ERROR".to_string()));
+    }
+
+    #[test]
+    fn test_dashboard_html_escapes_log_level_and_target() {
+        let handler = StaticFileHandler::new();
+        let js = handler.get_script_js();
+
+        // entry.level must be escaped in both the CSS class and text content
+        assert!(
+            js.contains("${escapeHtml(entry.level)}"),
+            "entry.level must be wrapped in escapeHtml to prevent XSS"
+        );
+        // entry.target must be escaped
+        assert!(
+            js.contains("${escapeHtml(entry.target || '')}"),
+            "entry.target must be wrapped in escapeHtml to prevent XSS"
+        );
+        // entry.message should already be escaped (pre-existing)
+        assert!(
+            js.contains("${escapeHtml(entry.message)}"),
+            "entry.message must remain wrapped in escapeHtml"
+        );
+        // Ensure no raw unescaped entry.level or entry.target in template literals
+        assert!(
+            !js.contains("${entry.level}"),
+            "entry.level must not appear unescaped in the template"
+        );
+        assert!(
+            !js.contains("${entry.target}") && !js.contains("${entry.target ||"),
+            "entry.target must not appear unescaped in the template"
+        );
+    }
+}

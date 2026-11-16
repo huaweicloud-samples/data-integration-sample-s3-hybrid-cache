@@ -1,0 +1,412 @@
+//! Health Check Module
+//!
+//! Provides health check endpoints and system status monitoring.
+
+use crate::cache::CacheManager;
+use crate::compression::CompressionHandler;
+use crate::connection_pool::ConnectionPoolManager;
+use crate::{ProxyError, Result};
+use hyper::{Request, Response, StatusCode};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
+// tracing macros used conditionally in debug builds
+
+/// Health check status
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HealthStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+/// Component health information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentHealth {
+    pub name: String,
+    pub status: HealthStatus,
+    pub message: Option<String>,
+    pub last_check: SystemTime,
+    pub response_time_ms: Option<u64>,
+}
+
+/// Overall system health
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemHealth {
+    pub status: HealthStatus,
+    pub timestamp: SystemTime,
+    pub components: Vec<ComponentHealth>,
+    pub uptime_seconds: u64,
+    /// Per-IP connection distribution stats (present when IP distribution is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_distribution: Option<crate::connection_pool::IpDistributionStats>,
+}
+
+/// Health check manager
+pub struct HealthManager {
+    start_time: SystemTime,
+    cache_manager: Option<Arc<CacheManager>>,
+    connection_pool: Option<Arc<tokio::sync::RwLock<ConnectionPoolManager>>>,
+    compression_handler: Option<Arc<CompressionHandler>>,
+    last_health_check: Arc<RwLock<Option<SystemHealth>>>,
+}
+
+impl Default for HealthManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HealthManager {
+    /// Create new health manager
+    pub fn new() -> Self {
+        Self {
+            start_time: SystemTime::now(),
+            cache_manager: None,
+            connection_pool: None,
+            compression_handler: None,
+            last_health_check: Arc::new(RwLock::new(None)),
+        }
+    }
+    /// Set cache manager reference
+    pub fn set_cache_manager(&mut self, cache_manager: Arc<CacheManager>) {
+        self.cache_manager = Some(cache_manager);
+    }
+
+    /// Set connection pool reference
+    pub fn set_connection_pool(
+        &mut self,
+        connection_pool: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
+    ) {
+        self.connection_pool = Some(connection_pool);
+    }
+
+    /// Set compression handler reference
+    pub fn set_compression_handler(&mut self, compression_handler: Arc<CompressionHandler>) {
+        self.compression_handler = Some(compression_handler);
+    }
+
+    /// Perform comprehensive health check
+    pub async fn check_health(&self) -> SystemHealth {
+        let start_time = SystemTime::now();
+        let mut components = Vec::new();
+
+        // Check cache health
+        if let Some(cache_manager) = &self.cache_manager {
+            components.push(self.check_cache_health(cache_manager).await);
+        }
+
+        // Check connection pool health
+        if let Some(connection_pool) = &self.connection_pool {
+            components.push(self.check_connection_pool_health(connection_pool).await);
+        }
+
+        // Collect IP distribution stats if any distributors are active
+        let ip_distribution = if let Some(connection_pool) = &self.connection_pool {
+            let pool = connection_pool.read().await;
+            let stats = pool.get_ip_distribution_stats();
+            if stats.endpoints.is_empty() {
+                None
+            } else {
+                Some(stats)
+            }
+        } else {
+            None
+        };
+
+        // Check compression handler health
+        if let Some(compression_handler) = &self.compression_handler {
+            components.push(self.check_compression_health(compression_handler).await);
+        }
+
+        // Determine overall status
+        let overall_status = self.determine_overall_status(&components);
+
+        let uptime = self
+            .start_time
+            .elapsed()
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+
+        let health = SystemHealth {
+            status: overall_status,
+            timestamp: start_time,
+            components,
+            uptime_seconds: uptime,
+            ip_distribution,
+        };
+
+        // Cache the result
+        {
+            let mut last_check = self.last_health_check.write().await;
+            *last_check = Some(health.clone());
+        }
+
+        health
+    }
+
+    /// Check cache system health
+    async fn check_cache_health(&self, cache_manager: &Arc<CacheManager>) -> ComponentHealth {
+        let start_time = SystemTime::now();
+
+        let stats = cache_manager.get_statistics();
+        let response_time = start_time
+            .elapsed()
+            .unwrap_or(Duration::from_millis(0))
+            .as_millis() as u64;
+
+        // Consider cache unhealthy if it's using more than 95% of available space
+        let usage_percent = (stats.read_cache_size + stats.write_cache_size) as f64
+            / stats.total_cache_size as f64
+            * 100.0;
+
+        let status = if usage_percent > 95.0 {
+            HealthStatus::Degraded
+        } else {
+            HealthStatus::Healthy
+        };
+
+        ComponentHealth {
+            name: "cache".to_string(),
+            status,
+            message: Some(format!("Cache usage: {:.1}%", usage_percent)),
+            last_check: start_time,
+            response_time_ms: Some(response_time),
+        }
+    }
+    /// Check connection pool health
+    async fn check_connection_pool_health(
+        &self,
+        connection_pool: &Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
+    ) -> ComponentHealth {
+        let start_time = SystemTime::now();
+        let pool = connection_pool.read().await;
+        let stats = pool.get_ip_distribution_stats();
+        let response_time = start_time
+            .elapsed()
+            .unwrap_or(Duration::from_millis(0))
+            .as_millis() as u64;
+
+        let total_ips: usize = stats
+            .endpoints
+            .iter()
+            .map(|e| e.total_distributor_ips)
+            .sum();
+
+        // Healthy if IPs are populated, or if no endpoints have been registered yet
+        // (normal at startup before first request). Only Degraded if an endpoint is
+        // registered but has zero IPs — meaning DNS resolution failed for a known endpoint.
+        let all_registered_empty = !stats.endpoints.is_empty()
+            && stats.endpoints.iter().all(|e| e.total_distributor_ips == 0);
+
+        let status = if all_registered_empty {
+            HealthStatus::Degraded
+        } else {
+            HealthStatus::Healthy
+        };
+
+        ComponentHealth {
+            name: "connection_pool".to_string(),
+            status,
+            message: Some(format!(
+                "{} endpoints, {} total IPs",
+                stats.endpoints.len(),
+                total_ips
+            )),
+            last_check: start_time,
+            response_time_ms: Some(response_time),
+        }
+    }
+
+    /// Check compression handler health
+    async fn check_compression_health(
+        &self,
+        compression_handler: &Arc<CompressionHandler>,
+    ) -> ComponentHealth {
+        let start_time = SystemTime::now();
+
+        // Test compression with a small sample
+        let _test_data = b"Hello, World! This is a test compression string.";
+
+        // Since compress_with_metadata requires &mut self, we'll just check if compression is enabled
+        let response_time = start_time
+            .elapsed()
+            .unwrap_or(Duration::from_millis(0))
+            .as_millis() as u64;
+
+        let status = if compression_handler.is_compression_enabled() {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Degraded
+        };
+
+        ComponentHealth {
+            name: "compression".to_string(),
+            status,
+            message: Some(format!(
+                "Compression enabled: {}",
+                compression_handler.is_compression_enabled()
+            )),
+            last_check: start_time,
+            response_time_ms: Some(response_time),
+        }
+    }
+
+    /// Determine overall system status from component statuses
+    fn determine_overall_status(&self, components: &[ComponentHealth]) -> HealthStatus {
+        if components.is_empty() {
+            return HealthStatus::Healthy;
+        }
+
+        let unhealthy_count = components
+            .iter()
+            .filter(|c| c.status == HealthStatus::Unhealthy)
+            .count();
+
+        let degraded_count = components
+            .iter()
+            .filter(|c| c.status == HealthStatus::Degraded)
+            .count();
+
+        if unhealthy_count > 0 {
+            HealthStatus::Unhealthy
+        } else if degraded_count > 0 {
+            HealthStatus::Degraded
+        } else {
+            HealthStatus::Healthy
+        }
+    }
+
+    /// Handle health check HTTP request
+    pub async fn handle_health_request(
+        &self,
+        _req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<String>> {
+        let health = self.check_health().await;
+
+        let status_code = match health.status {
+            HealthStatus::Healthy => StatusCode::OK,
+            HealthStatus::Degraded => StatusCode::OK, // Still return 200 for degraded
+            HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
+        };
+
+        let body = serde_json::to_string_pretty(&health).map_err(|e| {
+            ProxyError::SerializationError(format!("Failed to serialize health status: {}", e))
+        })?;
+
+        Response::builder()
+            .status(status_code)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ProxyError::HttpError(format!("Failed to build health response: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn component(status: HealthStatus) -> ComponentHealth {
+        ComponentHealth {
+            name: "test".to_string(),
+            status,
+            message: None,
+            last_check: SystemTime::now(),
+            response_time_ms: Some(0),
+        }
+    }
+
+    #[test]
+    fn test_determine_overall_status_empty_is_healthy() {
+        let mgr = HealthManager::new();
+        assert_eq!(mgr.determine_overall_status(&[]), HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_determine_overall_status_all_healthy() {
+        let mgr = HealthManager::new();
+        let components = [
+            component(HealthStatus::Healthy),
+            component(HealthStatus::Healthy),
+        ];
+        assert_eq!(
+            mgr.determine_overall_status(&components),
+            HealthStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn test_determine_overall_status_degraded_takes_precedence_over_healthy() {
+        let mgr = HealthManager::new();
+        let components = [
+            component(HealthStatus::Healthy),
+            component(HealthStatus::Degraded),
+        ];
+        assert_eq!(
+            mgr.determine_overall_status(&components),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn test_determine_overall_status_unhealthy_takes_precedence_over_degraded() {
+        let mgr = HealthManager::new();
+        let components = [
+            component(HealthStatus::Degraded),
+            component(HealthStatus::Unhealthy),
+            component(HealthStatus::Healthy),
+        ];
+        assert_eq!(
+            mgr.determine_overall_status(&components),
+            HealthStatus::Unhealthy
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_health_no_components_is_healthy() {
+        // A manager with no subsystems registered should report Healthy with
+        // an empty component list (startup / minimal-config case).
+        let mgr = HealthManager::new();
+        let health = mgr.check_health().await;
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert!(health.components.is_empty());
+        assert!(health.ip_distribution.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_health_result_is_cached() {
+        let mgr = HealthManager::new();
+        let _ = mgr.check_health().await;
+        let cached = mgr.last_health_check.read().await;
+        assert!(cached.is_some());
+    }
+
+    #[test]
+    fn test_system_health_serializes_to_json() {
+        let health = SystemHealth {
+            status: HealthStatus::Healthy,
+            timestamp: SystemTime::now(),
+            components: vec![component(HealthStatus::Healthy)],
+            uptime_seconds: 42,
+            ip_distribution: None,
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        // ip_distribution is skipped when None
+        assert!(!json.contains("ip_distribution"));
+        assert!(json.contains("uptime_seconds"));
+    }
+
+    #[test]
+    fn test_health_status_roundtrip() {
+        for status in [
+            HealthStatus::Healthy,
+            HealthStatus::Degraded,
+            HealthStatus::Unhealthy,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: HealthStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, back);
+        }
+    }
+}

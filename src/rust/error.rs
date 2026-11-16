@@ -1,0 +1,129 @@
+//! Error Module
+//!
+//! Defines error types and result types used throughout the S3 proxy application.
+
+use thiserror::Error;
+
+/// Main error type for the S3 proxy
+#[derive(Error, Debug, Clone)]
+pub enum ProxyError {
+    #[error("IO error: {0}")]
+    IoError(String),
+
+    #[error("HTTP error: {0}")]
+    HttpError(String),
+
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
+
+    #[error("Cache error: {0}")]
+    CacheError(String),
+
+    #[error("Compression error: {0}")]
+    CompressionError(String),
+
+    #[error("TLS error: {0}")]
+    TlsError(String),
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+
+    #[error("DNS error: {0}")]
+    DnsError(String),
+
+    #[error("Timeout error: {0}")]
+    TimeoutError(String),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+
+    #[error("Lock error: {0}")]
+    LockError(String),
+
+    #[error("Lock contention: {0}")]
+    LockContention(String),
+
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("S3 error: {0}")]
+    S3Error(String),
+
+    #[error("Internal error: {0}")]
+    InternalError(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
+    #[error("Invalid range: {0}")]
+    InvalidRange(String),
+
+    #[error("System error: {0}")]
+    SystemError(String),
+
+    #[error("Retry after {0} seconds")]
+    RetryAfter(u64),
+
+    #[error("Eviction fence lost: {0}")]
+    EvictionFenceLost(String),
+
+    #[error("Request body too large: content_length={content_length:?}, max_bytes={max_bytes}")]
+    RequestBodyTooLarge {
+        content_length: Option<u64>,
+        max_bytes: u64,
+    },
+
+    #[error("Upstream TLS validation failed for {endpoint}: {source_err}")]
+    UpstreamTlsValidationFailed {
+        endpoint: String,
+        source_err: String,
+    },
+
+    /// The in-flight buffered-byte ledger (`server.max_inflight_buffer_bytes`)
+    /// could not admit a Reservation for a Buffering_Site allocation. Maps to
+    /// the shared Shed_Response (HTTP 503 `SlowDown` with `Retry-After`), never
+    /// to HTTP 413 — this is a transient admission condition, not a statement
+    /// that the request itself is invalid.
+    ///
+    /// Requirements: IMA 2.1, 2.2
+    #[error(
+        "In-flight memory ceiling exceeded: ceiling_bytes={ceiling_bytes}, requested_bytes={requested_bytes}"
+    )]
+    InflightCeilingExceeded {
+        ceiling_bytes: u64,
+        requested_bytes: u64,
+    },
+}
+
+impl From<std::io::Error> for ProxyError {
+    fn from(err: std::io::Error) -> Self {
+        ProxyError::IoError(err.to_string())
+    }
+}
+
+impl From<hyper::Error> for ProxyError {
+    fn from(err: hyper::Error) -> Self {
+        ProxyError::HttpError(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for ProxyError {
+    fn from(err: serde_json::Error) -> Self {
+        ProxyError::SerializationError(err.to_string())
+    }
+}
+
+impl From<serde_yaml_ng::Error> for ProxyError {
+    fn from(err: serde_yaml_ng::Error) -> Self {
+        ProxyError::SerializationError(err.to_string())
+    }
+}
+
+impl From<hickory_resolver::net::NetError> for ProxyError {
+    fn from(err: hickory_resolver::net::NetError) -> Self {
+        ProxyError::DnsError(err.to_string())
+    }
+}
+
+/// Result type alias for the S3 proxy
+pub type Result<T> = std::result::Result<T, ProxyError>;

@@ -1,0 +1,916 @@
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use s3_proxy::{
+    background_recovery::{BackgroundRecoveryConfig, BackgroundRecoverySystem},
+    config::{Config, ServerMode},
+    dashboard::DashboardServer,
+    health::HealthManager,
+    http_proxy::HttpProxy,
+    https_proxy::HttpsProxy,
+    logging::LoggerManager,
+    metrics::MetricsManager,
+    orphaned_range_recovery::OrphanedRangeRecovery,
+    permissions::PermissionValidator,
+    shutdown::{ShutdownCoordinator, ShutdownSignal},
+    tls_proxy_listener::TlsProxyListener,
+    upstream_overrides::UpstreamOverrides,
+    Result,
+};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
+
+/// Return the HTTP response for a request that does not match a dedicated listener's route.
+///
+/// Health and metrics run on separate ports, but each port still accepts arbitrary HTTP
+/// requests. Restricting dispatch here makes the configured `endpoint` meaningful and
+/// prevents a scrape of an accidental path from being treated as valid service data.
+fn endpoint_rejection<B>(request: &Request<B>, endpoint: &str) -> Option<Response<String>> {
+    if request.uri().path() != endpoint {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(String::new())
+                .expect("static 404 response must be valid"),
+        );
+    }
+
+    if request.method() != Method::GET {
+        return Some(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("Allow", "GET")
+                .body(String::new())
+                .expect("static 405 response must be valid"),
+        );
+    }
+
+    None
+}
+
+/// Start health check HTTP server
+async fn start_health_server(
+    addr: SocketAddr,
+    endpoint: String,
+    health_manager: Arc<RwLock<HealthManager>>,
+    mut shutdown_signal: ShutdownSignal,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        s3_proxy::ProxyError::IoError(format!("Failed to bind health server: {}", e))
+    })?;
+
+    info!("Health check server listening on {}", addr);
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result.map_err(|e| {
+                    s3_proxy::ProxyError::IoError(format!("Failed to accept connection: {}", e))
+                })?;
+
+                let io = TokioIo::new(stream);
+                let health_manager_clone = health_manager.clone();
+                let endpoint = endpoint.clone();
+
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let health_manager = health_manager_clone.clone();
+                        let endpoint = endpoint.clone();
+                        async move {
+                            if let Some(response) = endpoint_rejection(&req, &endpoint) {
+                                return Ok(response);
+                            }
+                            health_manager.read().await.handle_health_request(req).await
+                        }
+                    });
+
+                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                        error!("Error serving health check connection: {}", e);
+                    }
+                });
+            }
+            _ = shutdown_signal.wait_for_shutdown() => {
+                info!("Health check server received shutdown signal");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Start metrics HTTP server
+async fn start_metrics_server(
+    addr: SocketAddr,
+    endpoint: String,
+    metrics_manager: Arc<RwLock<MetricsManager>>,
+    mut shutdown_signal: ShutdownSignal,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        s3_proxy::ProxyError::IoError(format!("Failed to bind metrics server: {}", e))
+    })?;
+
+    info!("Metrics server listening on {}", addr);
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result.map_err(|e| {
+                    s3_proxy::ProxyError::IoError(format!("Failed to accept connection: {}", e))
+                })?;
+
+                let io = TokioIo::new(stream);
+                let metrics_manager_clone = metrics_manager.clone();
+                let endpoint = endpoint.clone();
+
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let metrics_manager = metrics_manager_clone.clone();
+                        let endpoint = endpoint.clone();
+                        async move {
+                            if let Some(response) = endpoint_rejection(&req, &endpoint) {
+                                return Ok(response);
+                            }
+                            metrics_manager
+                                .read()
+                                .await
+                                .handle_metrics_request(req)
+                                .await
+                        }
+                    });
+
+                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                        error!("Error serving metrics connection: {}", e);
+                    }
+                });
+            }
+            _ = shutdown_signal.wait_for_shutdown() => {
+                info!("Metrics server received shutdown signal");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Set process umask to 0o077 so all files are created with owner-only permissions (Req 14).
+/// On non-Unix platforms, logs a warning since umask is not available.
+#[cfg(unix)]
+fn set_process_umask() {
+    // SAFETY: libc::umask is a simple syscall that sets the process file creation mask.
+    // It has no unsafe memory implications and always succeeds on Unix.
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_process_umask() {
+    // Cannot set umask on non-Unix platforms; warn at startup.
+    // Note: tracing is not yet initialized at this point, so use eprintln as a fallback.
+    eprintln!("WARN: umask not available on this platform; cache files may have permissive modes");
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Set restrictive umask before any file creation (Req 14)
+    set_process_umask();
+
+    // Load configuration
+    let config = Config::load()?;
+
+    // Validate directory permissions before initializing any components (Requirement 21)
+    PermissionValidator::validate_all(
+        &config.cache.cache_dir,
+        &config.logging.access_log_dir,
+        &config.logging.app_log_dir,
+        config.cache.write_cache_enabled,
+    )?;
+
+    // Initialize logging
+    let logging_config = s3_proxy::logging::LoggingConfig {
+        access_log_dir: config.logging.access_log_dir.clone(),
+        app_log_dir: config.logging.app_log_dir.clone(),
+        access_log_enabled: config.logging.access_log_enabled,
+        access_log_mode: match config.logging.access_log_mode {
+            s3_proxy::config::AccessLogMode::All => s3_proxy::logging::AccessLogMode::All,
+            s3_proxy::config::AccessLogMode::CachedOnly => {
+                s3_proxy::logging::AccessLogMode::CachedOnly
+            }
+        },
+        hostname: gethostname::gethostname().to_string_lossy().to_string(),
+        log_level: config.logging.log_level.clone(),
+        // Task 4.3: Pass config values for buffered access logging
+        access_log_flush_interval: config.logging.access_log_flush_interval,
+        access_log_buffer_size: config.logging.access_log_buffer_size,
+        access_log_retention_days: config.logging.access_log_retention_days,
+        app_log_retention_days: config.logging.app_log_retention_days,
+        log_cleanup_interval: config.logging.log_cleanup_interval,
+        access_log_file_rotation_interval: config.logging.access_log_file_rotation_interval,
+    };
+
+    let mut logger = LoggerManager::new(logging_config);
+    logger.initialize()?;
+
+    info!(
+        "Starting Hybrid Cache for Amazon S3 server v{} (built: {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_TIMESTAMP")
+    );
+    // Log mode-specific port information
+    match config.server.mode {
+        ServerMode::Standard => {
+            info!("Server mode: standard");
+            info!("HTTP port: {}", config.server.http_port);
+            info!("HTTPS port: {}", config.server.https_port);
+        }
+        ServerMode::ProxyOnly => {
+            info!("Server mode: proxy_only");
+            info!("HTTP forward proxy port: {}", config.server.proxy_port);
+        }
+    }
+
+    // Log cache configuration
+    info!(
+        "Cache eviction algorithm: {:?}",
+        config.cache.eviction_algorithm
+    );
+    info!(
+        "Disk cache: dir={}, max_size={}MB",
+        config.cache.cache_dir.display(),
+        config.cache.max_cache_size / 1024 / 1024
+    );
+
+    // One-time breaking-change migration warning: the per-bucket `_settings.json`
+    // mechanism has been replaced by `cache_dir/cache_rules.json`. Scan once at
+    // startup and warn (without reading/honouring the files) if any are present.
+    // (Requirements 7.1, 7.4)
+    s3_proxy::bucket_settings::warn_if_legacy_settings_present(&config.cache.cache_dir);
+    if config.cache.ram_cache_enabled {
+        info!(
+            "RAM cache: enabled, max_size={}MB",
+            config.cache.max_ram_cache_size / 1024 / 1024
+        );
+        info!("RAM-disk coherency: flush_interval={:?}, flush_threshold={}, verification_interval={:?}",
+            config.cache.ram_cache_flush_interval,
+            config.cache.ram_cache_flush_threshold,
+            config.cache.ram_cache_verification_interval);
+    } else {
+        info!("RAM cache: disabled");
+    }
+
+    // Log write cache status
+    if config.cache.write_cache_enabled {
+        info!(
+            "Write cache: enabled, max_object_size={}MB, put_ttl={:?}",
+            config.cache.write_cache_max_object_size / 1024 / 1024,
+            config.cache.put_ttl
+        );
+    } else {
+        info!("Write cache: disabled");
+    }
+
+    // Warn per protection-waiving upstream override (Requirement 1.6, 1.7).
+    // Startup-only diagnostic build of the matcher: cheap, runs once, and is
+    // separate from the connector/S3Client matcher used on the hot path. Only
+    // Plaintext / TlsUnvalidated entries are surfaced; TlsValidated waives
+    // nothing and is intentionally silent.
+    for entry in UpstreamOverrides::from_config(&config.connection_pool.upstream_overrides)
+        .protection_waiving_entries()
+    {
+        warn!(
+            endpoint = %entry.endpoint,
+            "Upstream override waives a security protection: {}",
+            entry.waived_protection()
+        );
+    }
+
+    // Initialize shutdown coordinator
+    let mut shutdown_coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
+
+    // Create HTTP proxy and optionally HTTPS proxy based on server mode
+    let config_arc = std::sync::Arc::new(config.clone());
+    let (mut http_proxy, https_proxy) = match config.server.mode {
+        ServerMode::Standard => {
+            // Standard mode: HTTP on http_port, HTTPS on https_port
+            let http_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.http_port));
+            let http_proxy = HttpProxy::new(http_addr, config_arc.clone())?;
+
+            let https_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.https_port));
+            let https_proxy = HttpsProxy::new(https_addr, config_arc.clone());
+
+            (http_proxy, Some(https_proxy))
+        }
+        ServerMode::ProxyOnly => {
+            // Proxy-only mode: HTTP forward proxy on proxy_port, no HTTPS passthrough
+            let proxy_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.server.proxy_port));
+            let http_proxy = HttpProxy::new(proxy_addr, config_arc.clone())?;
+
+            info!(
+                "Proxy-only mode: HTTP direct listener (port {}) not started",
+                config.server.http_port
+            );
+            info!(
+                "Proxy-only mode: HTTPS passthrough listener (port {}) not started",
+                config.server.https_port
+            );
+
+            (http_proxy, None)
+        }
+    };
+
+    // Set logger manager on HTTP proxy for access logging
+    let logger_manager = Arc::new(tokio::sync::Mutex::new(logger));
+    http_proxy.set_logger_manager(logger_manager.clone());
+
+    // Task 5.1: Set logger manager on shutdown coordinator for flushing access log buffer
+    shutdown_coordinator.set_logger_manager(logger_manager.clone());
+
+    // Get references to shared components from HTTP proxy for health/metrics monitoring
+    // Note: We use the HTTP proxy's components since both proxies create their own instances
+    let cache_manager_ref = http_proxy.get_cache_manager();
+    let connection_pool_ref = http_proxy.get_connection_pool();
+    let compression_handler_ref = http_proxy.get_compression_handler();
+    let s3_client_ref = http_proxy.get_s3_client();
+
+    // Wire cache manager and connection pool into shutdown coordinator
+    shutdown_coordinator.set_cache_manager(cache_manager_ref.clone());
+    shutdown_coordinator.set_connection_pool(connection_pool_ref.clone());
+
+    // Initialize health manager with component references
+    let mut health_manager = HealthManager::new();
+    health_manager.set_cache_manager(cache_manager_ref.clone());
+    health_manager.set_connection_pool(connection_pool_ref.clone());
+    health_manager.set_compression_handler(compression_handler_ref.clone());
+    let health_manager = Arc::new(RwLock::new(health_manager));
+
+    // Initialize metrics manager with component references
+    let mut metrics_manager = MetricsManager::new();
+    metrics_manager.set_cache_manager(cache_manager_ref.clone());
+    metrics_manager.set_connection_pool(connection_pool_ref.clone());
+    metrics_manager.set_compression_handler(compression_handler_ref.clone());
+    // Wire per-bucket accounting knobs from config.
+    // Spec: per-bucket-metrics. Requirements: 5.1, 7.1
+    metrics_manager.set_per_bucket_config(
+        config.metrics.per_bucket.max_series,
+        config.metrics.per_bucket.bucket_prefixes.clone(),
+    );
+
+    // Initialize OTLP if enabled
+    if let Err(e) = metrics_manager
+        .initialize_otlp(config.metrics.otlp.clone())
+        .await
+    {
+        error!("Failed to initialize OTLP metrics exporter: {}", e);
+    }
+
+    // Enable per-bucket OTLP observable counters when the flag is set.
+    // Must be called after initialize_otlp and before the Arc wrapping.
+    // Spec: per-bucket-metrics. Requirements: 4.1, 4.3
+    if config.metrics.otlp.per_bucket_enabled {
+        metrics_manager.enable_per_bucket_otlp().await;
+    }
+
+    let metrics_manager = Arc::new(RwLock::new(metrics_manager));
+
+    // Set metrics manager reference on cache manager for eviction coordination metrics
+    cache_manager_ref
+        .set_metrics_manager(metrics_manager.clone())
+        .await;
+
+    // Set cache size tracker on metrics manager for cache_size metrics
+    if let Some(size_tracker) = cache_manager_ref.get_size_tracker().await {
+        metrics_manager
+            .write()
+            .await
+            .set_cache_size_tracker(size_tracker);
+    }
+
+    // Set metrics manager reference on HTTP proxy for signed PUT caching metrics
+    http_proxy.set_metrics_manager(metrics_manager.clone());
+
+    // Wire active connections counter into metrics manager for concurrent request tracking
+    metrics_manager.write().await.set_active_connections(
+        http_proxy.get_active_connections(),
+        config.server.max_concurrent_requests,
+    );
+
+    // Wire the request-concurrency semaphore into metrics for permit observability
+    // (permits_held, permits_available). Requirement: TCA 5.1, 5.2
+    metrics_manager
+        .write()
+        .await
+        .set_request_semaphore(http_proxy.get_request_semaphore());
+
+    // Wire the in-flight buffered-byte ledger and RAM cache ceiling into metrics
+    // for observability (inflight_memory.*). Requirement: IMA 8.1-8.7
+    {
+        let mut mm = metrics_manager.write().await;
+        mm.set_inflight_ledger(http_proxy.get_inflight_ledger());
+        mm.set_ram_cache_max_bytes(config.cache.max_ram_cache_size);
+    }
+
+    // Start background cache hit update buffer flush task (for journal-based cache-hit updates)
+    let cache_hit_update_buffer = cache_manager_ref.get_cache_hit_update_buffer().await;
+    if let Some(buffer) = cache_hit_update_buffer {
+        info!("Starting cache hit update buffer flush background task (interval: 5s)");
+        let mut cache_hit_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+        let _cache_hit_flush_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Flush buffered cache-hit updates to journal
+                        match buffer.flush().await {
+                            Ok(result) => {
+                                if result.entries_flushed > 0 {
+                                    debug!(
+                                        "Cache hit update buffer flushed: entries={}, duration={}ms",
+                                        result.entries_flushed, result.duration_ms
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Cache hit update buffer flush failed: {}", e);
+                            }
+                        }
+                    }
+                    _ = cache_hit_shutdown.wait_for_shutdown() => {
+                        info!("Cache hit update buffer flush task received shutdown signal");
+                        // Final flush before stopping
+                        match buffer.flush().await {
+                            Ok(result) => {
+                                if result.entries_flushed > 0 {
+                                    info!("Cache hit update buffer final flush: {} entries", result.entries_flushed);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Cache hit update buffer final flush failed: {}", e);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        debug!("Cache hit update buffer flush disabled (shared storage mode not enabled)");
+    }
+
+    // Start background journal consolidation task (for atomic metadata writes and size tracking)
+    let journal_consolidator = cache_manager_ref.get_journal_consolidator().await;
+    let consolidation_interval = config.cache.shared_storage.consolidation_interval;
+    if let Some(consolidator) = journal_consolidator {
+        // Set journal consolidator on shutdown coordinator for final consolidation on shutdown
+        shutdown_coordinator.set_journal_consolidator(consolidator.clone());
+
+        info!(
+            "Starting journal consolidation background task (interval: {}s)",
+            consolidation_interval.as_secs()
+        );
+        let mut consolidation_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+        let _journal_consolidation_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(consolidation_interval);
+            // Use Delay behavior: if a cycle takes longer than the interval,
+            // skip missed ticks rather than bursting to catch up
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Run consolidation cycle - handles discovery, consolidation, size tracking,
+                        // eviction triggering, and cleanup all in one call
+                        match consolidator.run_consolidation_cycle().await {
+                            Ok(result) => {
+                                if result.entries_consolidated > 0 || result.eviction_triggered {
+                                    info!(
+                                        "Consolidation cycle: entries={}, size_delta={:+}, evicted={}, total_cache_size={}",
+                                        result.entries_consolidated,
+                                        result.size_delta,
+                                        result.bytes_evicted,
+                                        result.current_size
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Consolidation cycle failed: {}", e);
+                            }
+                        }
+                    }
+                    _ = consolidation_shutdown.wait_for_shutdown() => {
+                        info!("Journal consolidation background task received shutdown signal");
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        debug!("Journal consolidation disabled (shared storage mode not enabled)");
+    }
+
+    // Start background DNS refresh task for IP distribution
+    // Periodically re-resolves S3 endpoints so the round-robin distributor stays current
+    // as S3 rotates its IP addresses. Uses pool_check_interval from config (default: 10s).
+    if config.connection_pool.ip_distribution_enabled {
+        let dns_refresh_interval = config.connection_pool.pool_check_interval;
+        let dns_refresh_client = s3_client_ref.clone();
+        let mut dns_refresh_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+
+        info!(
+            "Starting DNS refresh background task (interval: {}s)",
+            dns_refresh_interval.as_secs()
+        );
+
+        let _dns_refresh_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(dns_refresh_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = dns_refresh_client.refresh_dns().await {
+                            warn!("DNS refresh failed: {}", e);
+                        }
+                        // Recovery probing shares this tick deliberately, and runs
+                        // after the refresh: the refresh holds health-excluded IPs
+                        // out of the distributor, and the probe is the only thing
+                        // that puts them back. Eligibility is governed by
+                        // health_probe_initial_cooldown / health_probe_max_cooldown,
+                        // so this interval only bounds how promptly an elapsed
+                        // cooldown is noticed. Sharing the task also keeps the
+                        // shutdown subscriber count unchanged.
+                        let readmitted = dns_refresh_client.probe_unhealthy_ips().await;
+                        if readmitted > 0 {
+                            info!("Recovery probe re-admitted {} IP(s) to their distributors", readmitted);
+                        }
+                    }
+                    _ = dns_refresh_shutdown.wait_for_shutdown() => {
+                        info!("DNS refresh background task received shutdown signal");
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        debug!("DNS refresh disabled (ip_distribution_enabled=false)");
+    }
+
+    // Start background log cleanup task
+    let cleanup_logger = logger_manager.clone();
+    let cleanup_interval = config.logging.log_cleanup_interval;
+    let access_retention = config.logging.access_log_retention_days;
+    let app_retention = config.logging.app_log_retention_days;
+    // Captured as owned strings so the cleanup task can name the directories it
+    // swept without holding a borrow on `config`.
+    let access_log_dir_display = config.logging.access_log_dir.display().to_string();
+    let app_log_dir_display = config.logging.app_log_dir.display().to_string();
+    let mut cleanup_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+
+    info!(
+        "Starting log cleanup background task (interval: {}s, access_retention: {}d, app_retention: {}d)",
+        cleanup_interval.as_secs(), access_retention, app_retention
+    );
+
+    let _log_cleanup_task = tokio::spawn(async move {
+        // Run cleanup once immediately at startup
+        {
+            let logger = cleanup_logger.lock().await;
+            match logger.rotate_logs(access_retention, app_retention) {
+                // Name the directories actually walked, and split deletions by
+                // tier. A non-zero adopted count is the only signal that an
+                // instance which used to write here has stopped cleaning up
+                // after itself. Reporting the paths is also what stops this line
+                // reading as a successful sweep when no sweep happened, which is
+                // how a gated access-log sweep looked identical to an empty one.
+                Ok(result) => info!(
+                    "Startup log cleanup: access={} {} deleted ({} own, {} adopted), app={} {} deleted ({} own, {} adopted), {} errors",
+                    access_log_dir_display,
+                    result.access_files_deleted,
+                    result.access_files_deleted - result.access_files_adopted,
+                    result.access_files_adopted,
+                    app_log_dir_display,
+                    result.app_files_deleted,
+                    result.app_files_deleted - result.app_files_adopted,
+                    result.app_files_adopted,
+                    result.errors
+                ),
+                Err(e) => warn!("Startup log cleanup failed: {}", e),
+            }
+        }
+
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // consume the immediate first tick
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let logger = cleanup_logger.lock().await;
+                    match logger.rotate_logs(access_retention, app_retention) {
+                        Ok(result) => {
+                            if result.access_files_deleted > 0 || result.app_files_deleted > 0 || result.errors > 0 {
+                                info!("Log cleanup: access={} {} deleted ({} own, {} adopted), app={} {} deleted ({} own, {} adopted), {} errors",
+                                    access_log_dir_display,
+                                    result.access_files_deleted,
+                                    result.access_files_deleted - result.access_files_adopted,
+                                    result.access_files_adopted,
+                                    app_log_dir_display,
+                                    result.app_files_deleted,
+                                    result.app_files_deleted - result.app_files_adopted,
+                                    result.app_files_adopted,
+                                    result.errors);
+                            }
+                        }
+                        Err(e) => warn!("Log cleanup failed: {}", e),
+                    }
+                }
+                _ = cleanup_shutdown.wait_for_shutdown() => {
+                    info!("Log cleanup task received shutdown signal");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Start background orphan recovery system
+    // This recovers orphaned .bin files that aren't tracked in metadata due to journal consolidation lag
+    if config.cache.shared_storage.orphan_recovery_enabled {
+        let hybrid_writer = cache_manager_ref.get_hybrid_metadata_writer().await;
+        if let Some(writer) = hybrid_writer {
+            info!(
+                "Starting background orphan recovery system (interval: {}s, max_per_cycle: {})",
+                config
+                    .cache
+                    .shared_storage
+                    .orphan_recovery_interval
+                    .as_secs(),
+                config.cache.shared_storage.orphan_max_per_cycle
+            );
+
+            let orphaned_recovery = Arc::new(OrphanedRangeRecovery::new(
+                config.cache.cache_dir.clone(),
+                writer,
+            ));
+
+            let recovery_config =
+                BackgroundRecoveryConfig::from_shared_storage_config(&config.cache.shared_storage);
+
+            let mut background_recovery = BackgroundRecoverySystem::new(
+                orphaned_recovery,
+                recovery_config,
+                config.cache.cache_dir.clone(),
+            );
+
+            // Start the background recovery system with shutdown coordinator subscription
+            let recovery_shutdown_rx = shutdown_coordinator.subscribe();
+            if let Err(e) = background_recovery.start(recovery_shutdown_rx).await {
+                error!("Failed to start background orphan recovery system: {}", e);
+            } else {
+                info!("Background orphan recovery system started successfully");
+            }
+        } else {
+            warn!("Cannot start orphan recovery: HybridMetadataWriter not available");
+        }
+    } else {
+        debug!(
+            "Background orphan recovery disabled (orphan_recovery_enabled={})",
+            config.cache.shared_storage.orphan_recovery_enabled
+        );
+    }
+
+    // Start health and metrics servers if enabled
+    let _health_task = if config.health.enabled {
+        info!(
+            "Starting health check server on {}:{}",
+            config.health.bind_address, config.health.port
+        );
+        let health_bind: std::net::IpAddr = config
+            .health
+            .bind_address
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let health_addr = SocketAddr::from((health_bind, config.health.port));
+        let health_endpoint = config.health.endpoint.clone();
+        let health_manager_clone = health_manager.clone();
+        let health_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+
+        Some(tokio::spawn(async move {
+            if let Err(e) = start_health_server(
+                health_addr,
+                health_endpoint,
+                health_manager_clone,
+                health_shutdown,
+            )
+            .await
+            {
+                error!("Health check server failed: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    let _metrics_task = if config.metrics.enabled {
+        info!(
+            "Starting metrics server on {}:{}",
+            config.metrics.bind_address, config.metrics.port
+        );
+        let metrics_bind: std::net::IpAddr = config
+            .metrics
+            .bind_address
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let metrics_addr = SocketAddr::from((metrics_bind, config.metrics.port));
+        let metrics_endpoint = config.metrics.endpoint.clone();
+        let metrics_manager_clone = metrics_manager.clone();
+        let metrics_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+
+        Some(tokio::spawn(async move {
+            if let Err(e) = start_metrics_server(
+                metrics_addr,
+                metrics_endpoint,
+                metrics_manager_clone,
+                metrics_shutdown,
+            )
+            .await
+            {
+                error!("Metrics server failed: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Subscribe shutdown signals for HTTP proxy (and HTTPS if in standard mode)
+    let http_shutdown_rx = shutdown_coordinator.subscribe();
+    let https_shutdown_rx = if https_proxy.is_some() {
+        Some(shutdown_coordinator.subscribe())
+    } else {
+        None
+    };
+
+    // Start TLS proxy listener if enabled
+    let _tls_task = if let Some(tls_config) = &config.server.tls {
+        if tls_config.enabled {
+            let tls_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], tls_config.tls_proxy_port));
+            match TlsProxyListener::new(
+                tls_addr,
+                &tls_config.cert_path,
+                &tls_config.key_path,
+                http_proxy.get_config(),
+                http_proxy.get_cache_manager(),
+                http_proxy.get_s3_client(),
+                http_proxy.get_range_handler(),
+                http_proxy.get_request_semaphore(),
+                http_proxy.get_active_connections(),
+                http_proxy.get_metrics_manager(),
+                http_proxy.get_logger_manager(),
+                http_proxy.get_inflight_tracker(),
+                http_proxy.get_proxy_referer(),
+            ) {
+                Ok(tls_listener) => {
+                    info!("TLS proxy port: {}", tls_config.tls_proxy_port);
+                    let tls_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+                    Some(tokio::spawn(async move {
+                        if let Err(e) = tls_listener.start(tls_shutdown).await {
+                            error!("TLS proxy listener failed: {}", e);
+                        }
+                    }))
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to start TLS proxy listener: {}. HTTP/HTTPS proxies will continue.",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Start dashboard server if enabled
+    let _dashboard_task = if config.dashboard.enabled {
+        info!(
+            "Starting dashboard server on port {}",
+            config.dashboard.port
+        );
+
+        // Create dashboard server with configuration
+        let dashboard_config = Arc::new(config.dashboard.clone());
+        let mut dashboard_server =
+            DashboardServer::new(dashboard_config, config.logging.app_log_dir.clone());
+
+        // Set component references
+        dashboard_server
+            .set_cache_manager(cache_manager_ref.clone())
+            .await;
+        dashboard_server
+            .set_metrics_manager(metrics_manager.clone())
+            .await;
+        dashboard_server.set_logger_manager(logger_manager.clone());
+        dashboard_server
+            .set_active_connections(
+                http_proxy.get_active_connections(),
+                config.server.max_concurrent_requests,
+            )
+            .await;
+
+        // Get shutdown signal for dashboard
+        let dashboard_shutdown = shutdown_coordinator.subscribe();
+        let dashboard_shutdown_signal = ShutdownSignal::new(dashboard_shutdown);
+
+        Some(tokio::spawn(async move {
+            if let Err(e) = dashboard_server.start(dashboard_shutdown_signal).await {
+                error!("Dashboard server failed: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Start shutdown listener
+    let shutdown_task = tokio::spawn(async move {
+        if let Err(e) = shutdown_coordinator.listen_for_shutdown().await {
+            error!("Shutdown coordinator failed: {}", e);
+        }
+    });
+
+    // Start HTTP proxy with shutdown signal
+    let http_shutdown = ShutdownSignal::new(http_shutdown_rx);
+    let _http_task = tokio::spawn(async move {
+        if let Err(e) = http_proxy.start(http_shutdown).await {
+            error!("HTTP proxy failed: {}", e);
+        }
+    });
+
+    // Start HTTPS proxy only in standard mode
+    let _https_task = if let Some(https_proxy) = https_proxy {
+        let https_shutdown = ShutdownSignal::new(
+            https_shutdown_rx.expect("HTTPS shutdown receiver must exist in standard mode"),
+        );
+        Some(tokio::spawn(async move {
+            if let Err(e) = https_proxy.start(https_shutdown).await {
+                error!("HTTPS proxy failed: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Wait for shutdown to complete — all components receive the broadcast signal
+    // and stop their accept loops. The shutdown_task runs the coordinator's teardown
+    // (flush logs, final consolidation, release locks, close pools).
+    shutdown_task.await.ok();
+    info!("Shutdown coordinator completed, waiting for server tasks");
+
+    // Give server tasks a moment to finish after receiving their shutdown signals
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    info!("Hybrid Cache for Amazon S3 shutdown complete");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_rejection_allows_only_get_on_the_configured_path() {
+        let allowed = Request::builder()
+            .method(Method::GET)
+            .uri("/ready")
+            .body(())
+            .expect("test request must build");
+        assert!(endpoint_rejection(&allowed, "/ready").is_none());
+
+        let wrong_path = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(())
+            .expect("test request must build");
+        assert_eq!(
+            endpoint_rejection(&wrong_path, "/ready")
+                .expect("wrong path must be rejected")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let wrong_method = Request::builder()
+            .method(Method::POST)
+            .uri("/ready")
+            .body(())
+            .expect("test request must build");
+        let response =
+            endpoint_rejection(&wrong_method, "/ready").expect("wrong method must be rejected");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get("allow").unwrap(), "GET");
+    }
+}
